@@ -8,11 +8,15 @@ import {
   type Material,
   type MaterialFilterState,
   type MaterialGrade,
+  type MaterialUnit,
   type ProcessMethod
 } from '@/types/material'
 import type { Proportion, ProportionRole } from '@/types/proportion'
+import type { Batch } from '@/types/batch'
+import type { Cellar } from '@/types/cellar'
+import { activeItems, isLedgerEmpty } from '@/utils/materialLedger'
 
-/** 香料库一行：香料 + 被引用情况 */
+/** 香料库一行：香料 + 被引用情况 + 库存占用 */
 export interface MaterialRow {
   material: Material
   /** 被多少个香方引用 */
@@ -23,23 +27,31 @@ export interface MaterialRow {
   ratioSum: number
   /** 在配比中承担的角色 */
   roles: ProportionRole[]
+  /** 未入窖批次已预留的量 */
+  reserved: number
+  /** 扣除预留后的可用余量 */
+  available: number
 }
 
 /**
  * 香料 store：维护香料库、炮制方式字典与检索条件，
- * 并统计每味香料被配比引用的情况（含引用香方）。
+ * 并统计每味香料被配比引用的情况（含引用香方）与批次预留占用。
  */
 export const useMaterialStore = defineStore('material', () => {
   const materialTable = useIdbTable<Material>((database) => database.materials)
   const proportionTable = useIdbTable<Proportion>((database) => database.proportions, {
     sortByUpdatedAt: false
   })
+  const batchTable = useIdbTable<Batch>((database) => database.batches, { sortByUpdatedAt: false })
+  const cellarTable = useIdbTable<Cellar>((database) => database.cellars, { sortByUpdatedAt: false })
 
   const filter = ref<MaterialFilterState>(createEmptyMaterialFilter())
   const processMethodDictionary = ref<ProcessMethod[]>(['生用', '酒蒸', '蜜炙', '炒黄', '醋浸'])
 
   const materials = computed<Material[]>(() => materialTable.rows.value)
   const proportions = computed<Proportion[]>(() => proportionTable.rows.value)
+  const batches = computed<Batch[]>(() => batchTable.rows.value)
+  const cellars = computed<Cellar[]>(() => cellarTable.rows.value)
   const loading = computed(() => materialTable.loading.value)
   const ready = computed(() => materialTable.ready.value)
   const error = computed(() => materialTable.error.value)
@@ -55,17 +67,35 @@ export const useMaterialStore = defineStore('material', () => {
     return grouped
   })
 
-  /** 香料库表格行：附带引用统计 */
+  /** 香料 id → 未入窖批次的预留合计（已入窖锁定的用料不再占库存容量） */
+  const reservedByMaterial = computed<Record<string, number>>(() => {
+    const cellaredBatchIds = new Set(cellars.value.map((cellar) => cellar.batchId))
+    const totals: Record<string, number> = {}
+    batches.value
+      .filter((batch) => !cellaredBatchIds.has(batch.id) && !isLedgerEmpty(batch.materialUsage))
+      .forEach((batch) => {
+        activeItems(batch).forEach((item) => {
+          totals[item.materialId] = Math.round(((totals[item.materialId] ?? 0) + item.requiredAmount) * 100) / 100
+        })
+      })
+    return totals
+  })
+
+  /** 香料库表格行：附带引用统计与库存占用 */
   const rows = computed<MaterialRow[]>(() =>
     materials.value.map((material) => {
       const list = proportionsByMaterial.value[material.id] ?? []
       const formulaIds = Array.from(new Set(list.map((item) => item.formulaId)))
+      const stock = Number.isFinite(material.stock) && material.stock > 0 ? material.stock : 0
+      const reserved = reservedByMaterial.value[material.id] ?? 0
       return {
         material,
         formulaCount: formulaIds.length,
         formulaIds,
         ratioSum: Math.round(list.reduce((sum, item) => sum + item.ratio, 0) * 100) / 100,
-        roles: Array.from(new Set(list.map((item) => item.role)))
+        roles: Array.from(new Set(list.map((item) => item.role))),
+        reserved,
+        available: Math.round(Math.max(stock - reserved, 0) * 100) / 100
       }
     })
   )
@@ -160,6 +190,8 @@ export const useMaterialStore = defineStore('material', () => {
     grade: MaterialGrade
     processMethod: ProcessMethod
     aromaNote: string
+    stock: number
+    unit: MaterialUnit
     createdAt: string
   }): Promise<Material> {
     return materialTable.create(
@@ -169,6 +201,8 @@ export const useMaterialStore = defineStore('material', () => {
         grade: payload.grade,
         processMethod: payload.processMethod,
         aromaNote: payload.aromaNote.trim(),
+        stock: Number.isFinite(payload.stock) && payload.stock > 0 ? Math.round(payload.stock * 100) / 100 : 0,
+        unit: payload.unit,
         createdAt: payload.createdAt
       },
       'material'
@@ -179,6 +213,11 @@ export const useMaterialStore = defineStore('material', () => {
     await materialTable.update(id, patch)
   }
 
+  /** 直接调整库存容量（入库 / 盘点） */
+  async function setStock(id: string, stock: number): Promise<void> {
+    await materialTable.update(id, { stock: Math.max(Math.round(stock * 100) / 100, 0) })
+  }
+
   /** 更新炮制方式并同步到字典 */
   async function setProcessMethod(id: string, processMethod: ProcessMethod): Promise<void> {
     await materialTable.update(id, { processMethod })
@@ -187,18 +226,48 @@ export const useMaterialStore = defineStore('material', () => {
     }
   }
 
-  /** 删除香料：同时级联删除引用它的配比记录（配比合计会因此变化） */
+  /** 引用该香料、且仍在预留或锁定用料账的批次数量 */
+  function batchReferenceCount(materialId: string): number {
+    return batches.value.filter(
+      (batch) =>
+        Array.isArray(batch.materialUsage?.items) &&
+        batch.materialUsage.items.some((item) => item.materialId === materialId)
+    ).length
+  }
+
+  /**
+   * 删除香料：同时级联删除引用它的配比记录（配比合计会因此变化）；
+   * 未入窖批次用料账中该味转为缺配比待核对，已入窖锁定的账目保留名称快照。
+   */
   async function removeMaterial(
     id: string
-  ): Promise<{ proportions: number; formulaIds: string[] }> {
+  ): Promise<{ proportions: number; formulaIds: string[]; pendingBatches: number }> {
     const list = proportionsByMaterial.value[id] ?? []
     const proportionIds = list.map((item) => item.id)
     const formulaIds = Array.from(new Set(list.map((item) => item.formulaId)))
-    await db.transaction('rw', [db.materials, db.proportions], async () => {
+    const affectedBatches = batches.value.filter(
+      (batch) =>
+        Array.isArray(batch.materialUsage?.items) &&
+        batch.materialUsage.items.some((item) => item.materialId === id)
+    )
+    await db.transaction('rw', [db.materials, db.proportions, db.batches], async () => {
+      for (const batch of affectedBatches) {
+        const items = batch.materialUsage.items.map((item) =>
+          item.materialId === id
+            ? item.locked
+              ? { ...item }
+              : { ...item, pending: true, requiredAmount: 0 }
+            : item
+        )
+        await db.batches.update(batch.id, {
+          materialUsage: { basisPerUnit: batch.materialUsage.basisPerUnit, items },
+          updatedAt: Date.now()
+        })
+      }
       await db.proportions.bulkDelete(proportionIds)
       await db.materials.delete(id)
     })
-    return { proportions: proportionIds.length, formulaIds }
+    return { proportions: proportionIds.length, formulaIds, pendingBatches: affectedBatches.length }
   }
 
   /** 批量删除未被引用的香料，用于香料库清理 */
@@ -212,6 +281,8 @@ export const useMaterialStore = defineStore('material', () => {
   return {
     materials,
     proportions,
+    batches,
+    cellars,
     loading,
     ready,
     error,
@@ -219,6 +290,7 @@ export const useMaterialStore = defineStore('material', () => {
     rows,
     filteredRows,
     proportionsByMaterial,
+    reservedByMaterial,
     originDictionary,
     processDictionary,
     gradeCounts,
@@ -231,8 +303,10 @@ export const useMaterialStore = defineStore('material', () => {
     materialById,
     materialName,
     referenceCount,
+    batchReferenceCount,
     createMaterial,
     updateMaterial,
+    setStock,
     setProcessMethod,
     removeMaterial,
     removeUnused

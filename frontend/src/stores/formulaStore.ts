@@ -220,16 +220,32 @@ export const useFormulaStore = defineStore('formula', () => {
     await formulaTable.update(id, { state })
   }
 
-  /** 级联删除：香方 → 配比 → 批次 → 窖藏 → 品香 */
+  /** 级联删除：香方 → 配比 → 批次 → 窖藏 → 品香；已出窖批次曾回冲的库存一并核销 */
   async function removeFormula(id: string): Promise<{ proportions: number; batches: number; cellars: number; tastings: number }> {
-    const batchIds = batches.value.filter((batch) => batch.formulaId === id).map((batch) => batch.id)
+    const formulaBatches = batches.value.filter((batch) => batch.formulaId === id)
+    const batchIds = formulaBatches.map((batch) => batch.id)
     const proportionIds = await db.proportions.where('formulaId').equals(id).primaryKeys()
     const cellarIds = batchIds.length > 0 ? await db.cellars.where('batchId').anyOf(batchIds).primaryKeys() : []
     const tastingIds = batchIds.length > 0 ? await db.tastings.where('batchId').anyOf(batchIds).primaryKeys() : []
     await db.transaction(
       'rw',
-      [db.formulas, db.proportions, db.batches, db.cellars, db.tastings],
+      [db.formulas, db.proportions, db.batches, db.cellars, db.tastings, db.materials],
       async () => {
+        // 出窖报废曾按损耗回冲进香料库的料，随香方删除核销，避免库存虚高
+        const writeOff = new Map<string, number>()
+        formulaBatches.forEach((batch) => {
+          batch.materialUsage?.items?.forEach((item) => {
+            if (item.writeBackAmount && item.writeBackAmount > 0) {
+              writeOff.set(item.materialId, (writeOff.get(item.materialId) ?? 0) + item.writeBackAmount)
+            }
+          })
+        })
+        for (const [materialId, amount] of writeOff) {
+          const material = await db.materials.get(materialId)
+          if (!material) continue
+          const stock = Math.max(((material.stock as number | undefined) ?? 0) - amount, 0)
+          await db.materials.update(materialId, { stock, updatedAt: Date.now() })
+        }
         await db.tastings.bulkDelete(tastingIds)
         await db.cellars.bulkDelete(cellarIds)
         await db.batches.bulkDelete(batchIds)

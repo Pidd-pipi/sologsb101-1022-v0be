@@ -44,6 +44,7 @@ docker compose up -d --build      # 代码改动后重新构建
 | UI 组件库 | Element Plus 2.x（含 `@element-plus/icons-vue`） | 表格、抽屉、对话框、表单、滑块、提示 |
 | 构建工具 | Vite 6 | 开发服务器端口 22822 |
 | 状态管理 | Pinia 2（setup store） | `formulaStore` / `materialStore` / `proportionStore` / `cellarStore` |
+| 用料账 | `utils/materialLedger.ts` | 库存容量预留、配比×数量折算、入窖锁定、出窖报废回冲（全部跑在 Dexie 事务内） |
 | 路由 | Vue Router 4（history 模式） | nginx 侧配合 `try_files $uri $uri/ /index.html` 做 SPA fallback |
 | 本地存储 | Dexie 4（IndexedDB 封装）+ localStorage | 库名 `gbincense`，含结构版本号与 `upgrade` 迁移逻辑 |
 | 拖拽排序 | HTML5 原生 `draggable` + `dragstart/dragover/drop` | 未引入 `vuedraggable` / `dnd-kit` 等额外依赖 |
@@ -112,16 +113,27 @@ sologsb101-1022/
 ## 五、IndexedDB 库名与数据存储说明
 
 - **库名**：`gbincense`（`frontend/src/utils/db.ts` 中的 `new IncenseDatabase()` → `super('gbincense')`）。
-- **结构版本号**：`export const DB_VERSION = 2`，同时写入 localStorage 键 `gbincense:db-version` 便于比对。
+- **结构版本号**：`export const DB_VERSION = 3`，同时写入 localStorage 键 `gbincense:db-version` 便于比对。
 
 | 表 | 主键与索引 | 说明 |
 | --- | --- | --- |
 | `formulas` | `id, name, scentType, usage, state, createdAt, totalRatio, updatedAt` | 香方主档，`totalRatio` 由配比页实时回写 |
-| `materials` | `id, name, origin, grade, processMethod, updatedAt` | 香料库与炮制方式 |
+| `materials` | `id, name, origin, grade, processMethod, stock, updatedAt` | 香料库与炮制方式；`stock`/`unit` 为本地库存容量（v3 新增） |
 | `proportions` | `id, formulaId, materialId, role, seq, updatedAt` | 君臣佐使配比，`seq` 为拖拽编排顺序 |
-| `batches` | `id, formulaId, mixedAt, formingMethod, updatedAt` | 和香批次，含 `snapshot` 配比快照 |
-| `cellars` | `id, batchId, startDate, endDate, state, updatedAt` | 窖藏批次与环境读数 |
+| `batches` | `id, formulaId, mixedAt, formingMethod, updatedAt` | 和香批次，含 `snapshot` 配比快照与 `materialUsage` 用料账（v3 新增） |
+| `cellars` | `id, batchId, startDate, endDate, state, updatedAt` | 窖藏批次与环境读数；`spoilCount`/`spoilRatePct` 记录出窖报废（v3 新增） |
 | `tastings` | `id, batchId, tastedAt, smokeScore, updatedAt` | 品香评鉴 |
+
+### 用料账（库存 / 配比 / 批次一本账）
+
+登记和香批次时按「配比占比 × 数量」逐味折算用料（`Batch.materialUsage`），全程以本地库存 `material.stock` 为容量：
+
+1. **开批预留**：先扣未入窖批次的预留合计再比库存；任一味不够就**整批拒绝**（不写批次），逐味列出缺哪几味、差多少（含它批已留量）。
+2. **多标签页并发**：建批与容量复验在同一个 IndexedDB 事务内，两个标签页同时提交同一批领用，只有先到者的预留生效，后到者复验失败、本侧留草稿，可点「按最新余量重试」。
+3. **改数量**：数量调小按实到数量重算，多占自然退回；调大需重新过容量，撑不住保留原数量。
+4. **改配比**：香方配比变动后自动（250ms 防抖）重算该方**未入窖**批次预留；已入窖批次用料 `locked` 锁成入窖当时那份。库存不足的批次保留原预留并在配比页提示。
+5. **入窖 / 出窖**：入窖即锁定用料并释放预留容量；出窖登记报废数，按报废率把报废单位对应的用料**回冲**库存（`writeBackAmount`），改报废数 / 状态回退做差额对称结算。
+6. **老档案升级（v2→v3）**：批次先按固化快照补用料账，快照缺失但配比还在的按当前配比补，**缺配比的味留空（`pending`）待核对**且不占库存；香料 `stock` 按现有未入窖预留补出（预留多少补多少），单位缺省 `g`；已入窖批次账目锁定，窖藏报废字段补 0。
 
 - **版本迁移**：`version(1).stores({...})` 为初版结构；`version(DB_VERSION).stores({...}).upgrade(async (tx) => {...})` 为真实迁移，会 `toCollection().modify(...)` 改写历史数据：
   1. 配比表补齐 `seq`（按 `formulaId` 分组顺序编号）与 `updatedAt`；

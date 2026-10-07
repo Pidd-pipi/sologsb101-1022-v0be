@@ -2,6 +2,9 @@
 export type MaterialGrade = '特级' | '一级' | '二级'
 export type ProcessMethod = '生用' | '酒蒸' | '蜜炙' | '炒黄' | '醋浸'
 
+/** 计量单位 */
+export type MaterialUnit = 'g' | 'ml' | '片'
+
 export interface Material {
   id: string
   /** 香料名 */
@@ -14,6 +17,10 @@ export interface Material {
   processMethod: ProcessMethod
   /** 香气特征 */
   aromaNote: string
+  /** 库存数量（本地账面上的总容量，单位 unit）；老档案无此字段时按现有预留补出 */
+  stock: number
+  /** 计量单位：g/ml/片 */
+  unit: MaterialUnit
   /** 入库日期（ISO 日期串 yyyy-MM-dd） */
   createdAt: string
   updatedAt: number
@@ -21,6 +28,7 @@ export interface Material {
 
 export const MATERIAL_GRADES: MaterialGrade[] = ['特级', '一级', '二级']
 export const PROCESS_METHODS: ProcessMethod[] = ['生用', '酒蒸', '蜜炙', '炒黄', '醋浸']
+export const MATERIAL_UNITS: MaterialUnit[] = ['g', 'ml', '片']
 
 /** 等级排序权重：特级最前，用于表格排序与等级配色 */
 export const GRADE_WEIGHT: Record<MaterialGrade, number> = {

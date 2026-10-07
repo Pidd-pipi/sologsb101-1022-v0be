@@ -11,10 +11,12 @@ import { useMaterialStore, type MaterialRow } from '@/stores/materialStore'
 import { useFormulaStore } from '@/stores/formulaStore'
 import {
   MATERIAL_GRADES,
+  MATERIAL_UNITS,
   PROCESS_METHODS,
   type Material,
   type MaterialGrade,
   type MaterialFilterState,
+  type MaterialUnit,
   type ProcessMethod
 } from '@/types/material'
 
@@ -34,6 +36,8 @@ const form = reactive<{
   grade: MaterialGrade
   processMethod: ProcessMethod
   aromaNote: string
+  stock: number
+  unit: MaterialUnit
   createdAt: string
 }>({
   name: '',
@@ -41,6 +45,8 @@ const form = reactive<{
   grade: '一级',
   processMethod: '生用',
   aromaNote: '',
+  stock: 0,
+  unit: 'g',
   createdAt: new Date().toISOString().slice(0, 10)
 })
 
@@ -51,7 +57,17 @@ const rules: FormRules = {
   ],
   origin: [{ required: true, message: '请填写产地', trigger: 'blur' }],
   grade: [{ required: true, message: '请选择等级', trigger: 'change' }],
-  processMethod: [{ required: true, message: '请选择炮制方式', trigger: 'change' }]
+  processMethod: [{ required: true, message: '请选择炮制方式', trigger: 'change' }],
+  unit: [{ required: true, message: '请选择计量单位', trigger: 'change' }],
+  stock: [
+    {
+      validator: (_rule, value: number, callback: (error?: Error) => void) => {
+        if (!Number.isFinite(value) || value < 0) callback(new Error('库存不能为负'))
+        else callback()
+      },
+      trigger: 'blur'
+    }
+  ]
 }
 
 const filterModel = computed<FilterModel>(() => ({
@@ -141,6 +157,8 @@ function openCreate(): void {
   form.grade = '一级'
   form.processMethod = '生用'
   form.aromaNote = ''
+  form.stock = 0
+  form.unit = 'g'
   form.createdAt = new Date().toISOString().slice(0, 10)
   dialogVisible.value = true
 }
@@ -152,6 +170,8 @@ function openEdit(material: Material): void {
   form.grade = material.grade
   form.processMethod = material.processMethod
   form.aromaNote = material.aromaNote
+  form.stock = material.stock
+  form.unit = material.unit
   form.createdAt = material.createdAt
   dialogVisible.value = true
 }
@@ -169,6 +189,8 @@ async function submitForm(): Promise<void> {
         grade: form.grade,
         processMethod: form.processMethod,
         aromaNote: form.aromaNote.trim(),
+        stock: form.stock,
+        unit: form.unit,
         createdAt: form.createdAt
       })
       ElMessage.success('香料信息已更新')
@@ -179,9 +201,11 @@ async function submitForm(): Promise<void> {
         grade: form.grade,
         processMethod: form.processMethod,
         aromaNote: form.aromaNote,
+        stock: form.stock,
+        unit: form.unit,
         createdAt: form.createdAt
       })
-      ElMessage.success(`已入库香料「${form.name.trim()}」`)
+      ElMessage.success(`已入库香料「${form.name.trim()}」，库存 ${form.stock}${form.unit}`)
     }
     dialogVisible.value = false
   } finally {
@@ -196,10 +220,15 @@ async function changeProcess(row: MaterialRow, method: ProcessMethod): Promise<v
 }
 
 async function removeMaterial(row: MaterialRow): Promise<void> {
+  const pendingBatches = materialStore.batchReferenceCount(row.material.id)
   const message =
-    row.formulaCount === 0
+    row.formulaCount === 0 && pendingBatches === 0
       ? `删除香料「${row.material.name}」？该香料尚未被任何配比引用。`
-      : `删除香料「${row.material.name}」将同时删除 ${row.formulaCount} 款香方下的配比记录（配比合计会随之变化），是否继续？`
+      : `删除香料「${row.material.name}」将同时删除 ${row.formulaCount} 款香方下的配比记录（配比合计会随之变化）` +
+        (pendingBatches > 0
+          ? `；另有 ${pendingBatches} 个和香批次的用料账引用它：未入窖的转为缺配比待核对、已入窖的锁定保留。`
+          : '。') +
+        '是否继续？'
   const confirmed = await ElMessageBox.confirm(message, '删除确认', {
     type: 'warning',
     confirmButtonText: '删除',
@@ -207,7 +236,10 @@ async function removeMaterial(row: MaterialRow): Promise<void> {
   }).catch(() => false)
   if (!confirmed) return
   const result = await materialStore.removeMaterial(row.material.id)
-  ElMessage.success(`已删除香料，连带清除配比 ${result.proportions} 条`)
+  ElMessage.success(
+    `已删除香料，连带清除配比 ${result.proportions} 条` +
+      (result.pendingBatches > 0 ? `，${result.pendingBatches} 个批次用料转为待核对` : '')
+  )
 }
 
 async function removeUnused(): Promise<void> {
@@ -312,7 +344,18 @@ function consumedBy(row: MaterialRow): string {
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="入库日期" prop="material.createdAt" width="120" />
+        <el-table-column label="库存 / 余量" width="170">
+          <template #default="{ row }: { row: MaterialRow }">
+            <div class="cell-sub">
+              库存 <span class="mono">{{ row.material.stock }}</span>{{ row.material.unit }}
+            </div>
+            <div class="cell-sub">
+              已预留 <span class="mono">{{ row.reserved }}</span>{{ row.material.unit }} ·
+              <span :class="row.available <= 0 ? 'ratio-error' : 'ratio-ok'">余 <span class="mono">{{ row.available }}</span></span>
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="入库日期" prop="material.createdAt" width="110" />
         <el-table-column label="操作" width="170" fixed="right">
           <template #default="{ row }: { row: MaterialRow }">
             <el-button size="small" :icon="Edit" text type="primary" @click="openEdit(row.material)">编辑</el-button>
@@ -350,6 +393,13 @@ function consumedBy(row: MaterialRow): string {
             placeholder="如：清甜带凉，尾韵有蔗糖气"
           />
         </el-form-item>
+        <el-form-item label="库存数量" prop="stock">
+          <el-input-number v-model="form.stock" :min="0" :max="999999" :step="50" :precision="2" style="width: 200px" />
+          <el-select v-model="form.unit" style="width: 90px; margin-left: 8px">
+            <el-option v-for="item in MATERIAL_UNITS" :key="item" :label="item" :value="item" />
+          </el-select>
+          <span class="muted form-hint">本地库存容量，开批预留先占这里</span>
+        </el-form-item>
         <el-form-item label="入库日期" prop="createdAt">
           <el-date-picker
             v-model="form.createdAt"
@@ -386,5 +436,10 @@ function consumedBy(row: MaterialRow): string {
 .cell-sub {
   font-size: 12px;
   line-height: 1.6;
+}
+
+.form-hint {
+  margin-left: 10px;
+  font-size: 12px;
 }
 </style>

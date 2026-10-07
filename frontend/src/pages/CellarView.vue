@@ -48,6 +48,7 @@ const form = reactive<{
   humidityPct: number
   container: CellarContainer
   state: CellarState
+  spoilCount: number
 }>({
   batchId: '',
   startDate: new Date().toISOString().slice(0, 10),
@@ -55,7 +56,8 @@ const form = reactive<{
   temperatureC: 22,
   humidityPct: 60,
   container: '陶罐',
-  state: '窖藏中'
+  state: '窖藏中',
+  spoilCount: 0
 })
 
 const rules: FormRules = {
@@ -95,6 +97,18 @@ const rules: FormRules = {
       },
       trigger: 'blur'
     }
+  ],
+  spoilCount: [
+    {
+      validator: (_rule, value: number, callback: (error?: Error) => void) => {
+        const batch = batchTable.rows.value.find((item) => item.id === form.batchId)
+        const max = batch?.quantity ?? 0
+        if (!Number.isFinite(value) || value < 0) callback(new Error('报废数不能为负'))
+        else if (max > 0 && value > max) callback(new Error(`报废数不能超过批次数量 ${max}`))
+        else callback()
+      },
+      trigger: 'blur'
+    }
   ]
 }
 
@@ -103,6 +117,14 @@ const watchedFormulaId = computed(() => {
   const batch = batchTable.rows.value.find((item) => item.id === form.batchId)
   return batch?.formulaId ?? null
 })
+
+/** 表单所选批次的数量，报废数上限与损耗率展示用 */
+const selectedBatchQuantity = computed(
+  () => batchTable.rows.value.find((item) => item.id === form.batchId)?.quantity ?? 0
+)
+const selectedSpoilRate = computed(() =>
+  selectedBatchQuantity.value > 0 ? round((form.spoilCount / selectedBatchQuantity.value) * 100, 2) : 0
+)
 const {
   checkLevel: ratioLevel,
   checkMessage: ratioMessage,
@@ -242,6 +264,7 @@ function openCreate(): void {
   form.humidityPct = 60
   form.container = '陶罐'
   form.state = '窖藏中'
+  form.spoilCount = 0
   dialogVisible.value = true
 }
 
@@ -254,6 +277,7 @@ function openEdit(cellar: Cellar): void {
   form.humidityPct = cellar.humidityPct
   form.container = cellar.container
   form.state = cellar.state
+  form.spoilCount = cellar.spoilCount
   dialogVisible.value = true
 }
 
@@ -271,9 +295,10 @@ async function submitForm(): Promise<void> {
         temperatureC: form.temperatureC,
         humidityPct: form.humidityPct,
         container: form.container,
-        state: form.state
+        state: form.state,
+        spoilCount: form.state === '已出窖' ? form.spoilCount : 0
       })
-      ElMessage.success('窖藏环境记录已更新')
+      ElMessage.success('窖藏环境记录已更新，用料账随报废情况同步回冲')
     } else {
       await cellarStore.createCellar({
         batchId: form.batchId,
@@ -282,9 +307,14 @@ async function submitForm(): Promise<void> {
         temperatureC: form.temperatureC,
         humidityPct: form.humidityPct,
         container: form.container,
-        state: form.state
+        state: form.state,
+        spoilCount: form.state === '已出窖' ? form.spoilCount : 0
       })
-      ElMessage.success('已登记窖藏批次，临近出窖会自动提醒')
+      ElMessage.success(
+        form.state === '已出窖'
+          ? `已登记出窖，报废 ${form.spoilCount} 件按损耗回冲香料库`
+          : '已登记窖藏，用料锁成入窖当时那份，临近出窖会自动提醒'
+      )
     }
     dialogVisible.value = false
   } finally {
@@ -294,7 +324,20 @@ async function submitForm(): Promise<void> {
 
 async function advanceState(row: CellarRow): Promise<void> {
   const next = await cellarStore.advanceState(row.cellar.id)
-  if (next) ElMessage.success(`「${row.formulaName}」已流转为「${next}」`)
+  if (next === '已出窖') {
+    ElMessage.success(`「${row.formulaName}」已出窖${row.spoilRatePct > 0 ? `，报废 ${row.cellar.spoilCount} 件已按损耗回冲` : '，无报废回冲'}`)
+  } else if (next) {
+    ElMessage.success(`「${row.formulaName}」已回退为在窖，回冲过的用料重新领出`)
+  }
+}
+
+/** 出窖后就地改报废数：差额按损耗率增量回冲 / 领回 */
+async function updateSpoil(row: CellarRow, value: number | undefined): Promise<void> {
+  const spoilCount = Math.round(value ?? 0)
+  if (spoilCount === row.cellar.spoilCount) return
+  await cellarStore.setSpoilCount(row.cellar.id, spoilCount)
+  const rate = row.quantity > 0 ? round((spoilCount / row.quantity) * 100, 2) : 0
+  ElMessage.success(`报废已改为 ${spoilCount} 件（${rate}%），库存差额已回冲`)
 }
 
 async function setState(row: CellarRow, state: CellarState): Promise<void> {
@@ -491,6 +534,25 @@ const formingText = (batchId: string): FormingMethod | '—' =>
             </el-tag>
           </template>
         </el-table-column>
+        <el-table-column label="报废 / 回冲" width="150">
+          <template #default="{ row }: { row: CellarRow }">
+            <template v-if="row.cellar.state === '已出窖'">
+              <el-input-number
+                :model-value="row.cellar.spoilCount"
+                :min="0"
+                :max="row.quantity"
+                :step="1"
+                :precision="0"
+                size="small"
+                controls-position="right"
+                style="width: 104px"
+                @change="(value: number | undefined) => updateSpoil(row, value)"
+              />
+              <div class="cell-sub muted">件 · 损耗 {{ row.spoilRatePct }}% 已回冲</div>
+            </template>
+            <span v-else class="cell-sub muted">出窖时登记</span>
+          </template>
+        </el-table-column>
         <el-table-column label="操作" width="270" fixed="right">
           <template #default="{ row }: { row: CellarRow }">
             <el-button
@@ -561,6 +623,12 @@ const formingText = (batchId: string): FormingMethod | '—' =>
           <el-select v-model="form.state" style="width: 100%">
             <el-option v-for="item in CELLAR_STATES" :key="item" :label="item" :value="item" />
           </el-select>
+        </el-form-item>
+        <el-form-item v-if="form.state === '已出窖'" label="报废数量" prop="spoilCount">
+          <el-input-number v-model="form.spoilCount" :min="0" :max="selectedBatchQuantity" :step="1" :precision="0" style="width: 180px" />
+          <span class="muted form-hint">
+            件 / 共 {{ selectedBatchQuantity }} 件（{{ selectedSpoilRate }}%），报废用料按损耗回冲库存
+          </span>
         </el-form-item>
         <el-alert
           v-if="watchedFormulaId"

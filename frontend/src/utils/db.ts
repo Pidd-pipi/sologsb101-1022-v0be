@@ -1,13 +1,15 @@
 import Dexie, { type Table } from 'dexie'
 import type { Formula } from '@/types/formula'
-import type { Material } from '@/types/material'
+import type { Material, MaterialUnit } from '@/types/material'
 import type { Proportion } from '@/types/proportion'
-import type { Batch } from '@/types/batch'
+import type { Batch, BatchMaterialLedger } from '@/types/batch'
 import type { Cellar } from '@/types/cellar'
 import type { Tasting } from '@/types/tasting'
+import { buildUsageFromSnapshot, createEmptyLedger, isLedgerEmpty, recalcLedger } from '@/utils/materialLedger'
+
 
 /** 本地结构版本号：新增/修改表结构时必须递增，并补充 upgrade 迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 本地存储键名（localStorage 侧的少量元数据） */
 export const LS_KEYS = {
@@ -64,7 +66,7 @@ export class IncenseDatabase extends Dexie {
       tastings: 'id, batchId, tastedAt, smokeScore'
     })
     // v2：配比表补 seq 索引、批次与窖藏补日期索引，并回填历史脏数据
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         formulas: 'id, name, scentType, usage, state, createdAt, totalRatio, updatedAt',
         materials: 'id, name, origin, grade, processMethod, updatedAt',
@@ -106,6 +108,93 @@ export class IncenseDatabase extends Dexie {
             if (typeof tasting.lastingMin !== 'number' || Number.isNaN(tasting.lastingMin)) {
               tasting.lastingMin = 0
             }
+          })
+      })
+    // v3：香料库补库存容量（stock/unit），批次补用料账，窖藏补报废数；老档案按现有预留补账
+    this.version(DB_VERSION)
+      .stores({
+        formulas: 'id, name, scentType, usage, state, createdAt, totalRatio, updatedAt',
+        materials: 'id, name, origin, grade, processMethod, stock, updatedAt',
+        proportions: 'id, formulaId, materialId, role, seq, updatedAt',
+        batches: 'id, formulaId, mixedAt, formingMethod, updatedAt',
+        cellars: 'id, batchId, startDate, endDate, state, updatedAt',
+        tastings: 'id, batchId, tastedAt, smokeScore, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        const [materials, proportions, batches, cellars] = await Promise.all([
+          tx.table<Material>('materials').toArray(),
+          tx.table<Proportion>('proportions').toArray(),
+          tx.table<Batch>('batches').toArray(),
+          tx.table<Cellar>('cellars').toArray()
+        ])
+        const materialMap = new Map(materials.map((material) => [material.id, material]))
+        const proportionsByFormula = new Map<string, Proportion[]>()
+        proportions.forEach((proportion) => {
+          const list = proportionsByFormula.get(proportion.formulaId) ?? []
+          list.push(proportion)
+          proportionsByFormula.set(proportion.formulaId, list)
+        })
+        // 有窖藏记录（在窖或已出窖）的批次，用料锁成当时那份
+        const cellaredBatchIds = new Set(cellars.map((cellar) => cellar.batchId))
+        // 迁移 4：批次补用料账——先按固化快照折算；快照缺失但配比还在的按当前配比补
+        for (const batch of batches) {
+          let ledger: BatchMaterialLedger
+          if (!isLedgerEmpty(batch.materialUsage)) {
+            ledger = batch.materialUsage
+          } else if (Array.isArray(batch.snapshot) && batch.snapshot.length > 0) {
+            ledger = { basisPerUnit: 1, items: buildUsageFromSnapshot(batch.snapshot, batch.quantity, 1) }
+          } else {
+            // 缺配比的先留空待核对
+            ledger = recalcLedger({
+              ledger: createEmptyLedger(),
+              proportions: proportionsByFormula.get(batch.formulaId) ?? [],
+              materialMap,
+              quantity: batch.quantity
+            })
+          }
+          ledger.items = ledger.items.map((item) => ({
+            ...item,
+            unit: materialMap.get(item.materialId)?.unit ?? item.unit ?? '',
+            locked: cellaredBatchIds.has(batch.id) ? true : item.locked
+          }))
+          await tx.table<Batch>('batches').update(batch.id, { materialUsage: ledger })
+        }
+
+        // 迁移 5：老档案缺库存数，按现有未入窖批次的预留补出来（预留多少，库存补多少）
+        const reservedTotals = new Map<string, number>()
+        batches
+          .filter((batch) => !cellaredBatchIds.has(batch.id))
+          .forEach((batch) => {
+            const ledger = isLedgerEmpty(batch.materialUsage)
+              ? { basisPerUnit: 1, items: buildUsageFromSnapshot(batch.snapshot ?? [], batch.quantity, 1) }
+              : batch.materialUsage
+            ledger.items
+              .filter((item) => !item.pending)
+              .forEach((item) => {
+                reservedTotals.set(item.materialId, (reservedTotals.get(item.materialId) ?? 0) + item.requiredAmount)
+              })
+          })
+        for (const material of materials) {
+          const patch: Partial<Material> = {}
+          if (typeof material.unit !== 'string' || material.unit.length === 0) {
+            patch.unit = 'g' as MaterialUnit
+          }
+          if (!Number.isFinite(material.stock) || material.stock < 0) {
+            const reserved = Math.ceil((reservedTotals.get(material.id) ?? 0) * 100) / 100
+            patch.stock = reserved
+          }
+          if (Object.keys(patch).length > 0) {
+            await tx.table<Material>('materials').update(material.id, patch)
+          }
+        }
+
+        // 迁移 6：窖藏补报废数量与比例（老档案无报废记录，默认 0，不回冲）
+        await tx
+          .table<Cellar>('cellars')
+          .toCollection()
+          .modify((cellar) => {
+            if (!Number.isFinite(cellar.spoilCount) || cellar.spoilCount < 0) cellar.spoilCount = 0
+            if (!Number.isFinite(cellar.spoilRatePct) || cellar.spoilRatePct < 0) cellar.spoilRatePct = 0
           })
       })
   }
@@ -216,15 +305,33 @@ export async function exportSnapshot(): Promise<IncenseSnapshot> {
 /** 按主键 bulkPut 写入快照；overwrite 为 true 时先清空全部表 */
 export async function importSnapshot(snapshot: IncenseSnapshot, overwrite = false): Promise<void> {
   if (overwrite) await clearAllTables()
+  // 老版本导出的快照可能没有库存 / 用料账 / 报废字段，补齐默认值避免页面读到 undefined
+  const materials = snapshot.materials.map((material) => ({
+    ...material,
+    stock: Number.isFinite(material.stock) && material.stock > 0 ? material.stock : 0,
+    unit: material.unit ?? 'g'
+  }))
+  const batches = snapshot.batches.map((batch) => ({
+    ...batch,
+    materialUsage:
+      batch.materialUsage && Array.isArray(batch.materialUsage.items)
+        ? batch.materialUsage
+        : { basisPerUnit: 1, items: buildUsageFromSnapshot(batch.snapshot ?? [], batch.quantity, 1) }
+  }))
+  const cellars = snapshot.cellars.map((cellar) => ({
+    ...cellar,
+    spoilCount: Number.isFinite(cellar.spoilCount) ? cellar.spoilCount : 0,
+    spoilRatePct: Number.isFinite(cellar.spoilRatePct) ? cellar.spoilRatePct : 0
+  }))
   await db.transaction(
     'rw',
     [db.formulas, db.materials, db.proportions, db.batches, db.cellars, db.tastings],
     async () => {
       await db.formulas.bulkPut(snapshot.formulas)
-      await db.materials.bulkPut(snapshot.materials)
+      await db.materials.bulkPut(materials)
       await db.proportions.bulkPut(snapshot.proportions)
-      await db.batches.bulkPut(snapshot.batches)
-      await db.cellars.bulkPut(snapshot.cellars)
+      await db.batches.bulkPut(batches)
+      await db.cellars.bulkPut(cellars)
       await db.tastings.bulkPut(snapshot.tastings)
     }
   )
@@ -312,6 +419,8 @@ export async function seedDatabase(): Promise<void> {
       grade: '特级',
       processMethod: '生用',
       aromaNote: '清甜带凉，尾韵有蔗糖气',
+      stock: 2002,
+      unit: 'g',
       createdAt: '2024-02-18',
       updatedAt: now
     },
@@ -322,6 +431,8 @@ export async function seedDatabase(): Promise<void> {
       grade: '特级',
       processMethod: '酒蒸',
       aromaNote: '奶香厚重，留香绵长',
+      stock: 1500,
+      unit: 'g',
       createdAt: '2024-02-20',
       updatedAt: now
     },
@@ -332,6 +443,8 @@ export async function seedDatabase(): Promise<void> {
       grade: '一级',
       processMethod: '醋浸',
       aromaNote: '树脂清香，微带柑橘前调',
+      stock: 902,
+      unit: 'g',
       createdAt: '2024-04-02',
       updatedAt: now
     },
@@ -342,6 +455,8 @@ export async function seedDatabase(): Promise<void> {
       grade: '二级',
       processMethod: '炒黄',
       aromaNote: '辛香穿透，少许即显',
+      stock: 402,
+      unit: 'g',
       createdAt: '2024-04-06',
       updatedAt: now
     }
@@ -379,6 +494,30 @@ export async function seedDatabase(): Promise<void> {
       }
     })
 
+  /** 播种用料账：两批均有窖藏记录，入窖即锁定 */
+  const toUsage = (rows: Array<[string, string, number, Proportion['role'], string]>, quantity: number, spoilRate = 0) =>
+    rows.map((row) => {
+      const material = materials.find((item) => item.id === row[0])
+      const requiredAmount = Math.round(((row[2] / 100) * quantity) * 100) / 100
+      return {
+        materialId: row[0],
+        materialName: material?.name ?? '未知香料',
+        ratio: row[2],
+        role: row[3],
+        requiredAmount,
+        unit: material?.unit ?? 'g',
+        locked: true,
+        pending: false,
+        ...(spoilRate > 0
+          ? {
+              writeBackAmount: Math.round(requiredAmount * spoilRate * 100) / 100,
+              spoilAmount: Math.round(requiredAmount * spoilRate * 100) / 100,
+              writeBackRatePct: Math.round(spoilRate * 10000) / 100
+            }
+          : {})
+      }
+    })
+
   const batches: Batch[] = [
     {
       id: SEED_IDS.batchLine,
@@ -389,6 +528,7 @@ export async function seedDatabase(): Promise<void> {
       operator: '林砚舟',
       snapshot: toSnapshot(lineRatio),
       snapshotAt: new Date('2024-04-01T09:00:00').getTime(),
+      materialUsage: { basisPerUnit: 1, items: toUsage(lineRatio, 320) },
       updatedAt: now
     },
     {
@@ -400,6 +540,8 @@ export async function seedDatabase(): Promise<void> {
       operator: '周若谷',
       snapshot: toSnapshot(pillRatio),
       snapshotAt: new Date('2024-06-15T14:30:00').getTime(),
+      // 出窖报废 6 丸（5%），已按损耗回冲库存
+      materialUsage: { basisPerUnit: 1, items: toUsage(pillRatio, 120, 0.05) },
       updatedAt: now
     }
   ]
@@ -414,6 +556,8 @@ export async function seedDatabase(): Promise<void> {
       humidityPct: 58,
       container: '陶罐',
       state: '窖藏中',
+      spoilCount: 0,
+      spoilRatePct: 0,
       updatedAt: now
     },
     {
@@ -425,6 +569,8 @@ export async function seedDatabase(): Promise<void> {
       humidityPct: 62,
       container: '锡罐',
       state: '已出窖',
+      spoilCount: 6,
+      spoilRatePct: 5,
       updatedAt: now
     }
   ]

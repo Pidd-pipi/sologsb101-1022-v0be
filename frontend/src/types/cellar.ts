@@ -18,6 +18,10 @@ export interface Cellar {
   container: CellarContainer
   /** 状态：窖藏中/已出窖 */
   state: CellarState
+  /** 出窖报废数量（支/丸/饼），出窖登记时填写并按损耗回冲香料账 */
+  spoilCount: number
+  /** 报废比例 %（0 ~ 100），由 spoilCount / 批次数量 折算保存 */
+  spoilRatePct: number
   updatedAt: number
 }
 
@@ -46,6 +50,8 @@ export interface CellarRow {
   /** 已窖藏天数 */
   agedDays: number
   urgency: CellarUrgency
+  /** 报废比例 %（窖藏记录的值，缺省按报废数/批次数量折算） */
+  spoilRatePct: number
 }
 
 /** 窖藏环境读数筛选条件 */

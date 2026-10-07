@@ -20,8 +20,22 @@ const router = useRouter()
 const formulaStore = useFormulaStore()
 const materialStore = useMaterialStore()
 const proportionStore = useProportionStore()
-const { rows, rolePreview, total, gap, checkLevel, checkMessage, add, update, remove, rescale, sortByRole, reorder, clearFormula } =
-  useProportion()
+const {
+  rows,
+  rolePreview,
+  total,
+  gap,
+  checkLevel,
+  checkMessage,
+  recalcRejected,
+  add,
+  update,
+  remove,
+  rescale,
+  sortByRole,
+  reorder,
+  clearFormula
+} = useProportion()
 
 const dialogVisible = ref(false)
 const submitting = ref(false)
@@ -87,6 +101,19 @@ const filterModel = computed<FilterModel>(() => ({
   role: proportionStore.filter.roles,
   grade: proportionStore.filter.grades
 }))
+
+// 改方后未入窖批次预留重算失败（库存撑不住）的提示
+watch(
+  recalcRejected,
+  (rejected) => {
+    if (!rejected || rejected.length === 0) return
+    const labels = rejected
+      .slice(0, 3)
+      .map((batch) => `${batch.mixedAt}（${batch.quantity} 支）`)
+      .join('、')
+    ElMessage.warning(`库存容量不足，${rejected.length} 个未入窖批次保留原预留：${labels}`)
+  }
+)
 
 const filterSelects = computed(() => [
   { key: 'role', label: '君臣佐使', options: PROPORTION_ROLES.map((item) => ({ label: item, value: item })) },

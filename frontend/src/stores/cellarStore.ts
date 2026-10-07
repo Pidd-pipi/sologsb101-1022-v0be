@@ -16,6 +16,7 @@ import {
 import type { Batch } from '@/types/batch'
 import type { Formula } from '@/types/formula'
 import { round } from '@/utils/ratio'
+import { lockBatchUsage, settleSpoil, unlockBatchUsage } from '@/utils/materialLedger'
 
 /** 一天的毫秒数 */
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -105,14 +106,22 @@ export const useCellarStore = defineStore('cellar', () => {
   const rows = computed<CellarRow[]>(() =>
     cellars.value.map((cellar) => {
       const batch = batchMap.value[cellar.batchId]
+      const quantity = batch?.quantity ?? 0
+      const spoilRate =
+        cellar.spoilRatePct > 0
+          ? cellar.spoilRatePct
+          : cellar.spoilCount > 0 && quantity > 0
+            ? round((cellar.spoilCount / quantity) * 100, 2)
+            : 0
       return {
         cellar,
         batchLabel: batchLabel(cellar.batchId),
         formulaName: batch ? formulaNameMap.value[batch.formulaId] ?? '香方已删除' : '香方已删除',
-        quantity: batch?.quantity ?? 0,
+        quantity,
         remainDays: daysBetween(todayIso(), cellar.endDate),
         agedDays: daysBetween(cellar.startDate, todayIso()),
-        urgency: urgencyOf(cellar)
+        urgency: urgencyOf(cellar),
+        spoilRatePct: spoilRate
       }
     })
   )
@@ -209,6 +218,24 @@ export const useCellarStore = defineStore('cellar', () => {
     return cellars.value.filter((cellar) => cellar.batchId === batchId)
   }
 
+  /** 窖藏记录的报废比例：优先记录值，缺省按报废数 / 批次数量折算 */
+  function spoilRateOf(cellar: Cellar, quantity?: number): number {
+    if (cellar.spoilRatePct > 0) return cellar.spoilRatePct
+    const qty = quantity ?? batchMap.value[cellar.batchId]?.quantity ?? 0
+    if (cellar.spoilCount > 0 && qty > 0) return round((cellar.spoilCount / qty) * 100, 2)
+    return 0
+  }
+
+  /** 按窖藏记录是否存在，把批次用料锁定 / 解锁（删除窖藏后恢复为可重算预留） */
+  async function resyncBatchLock(batchId: string): Promise<void> {
+    const exists = await db.cellars.where('batchId').equals(batchId).count()
+    if (exists > 0) {
+      await lockBatchUsage(batchId)
+    } else {
+      await unlockBatchUsage(batchId)
+    }
+  }
+
   async function createCellar(payload: {
     batchId: string
     startDate: string
@@ -217,8 +244,12 @@ export const useCellarStore = defineStore('cellar', () => {
     humidityPct: number
     container: CellarContainer
     state?: CellarState
+    spoilCount?: number
   }): Promise<Cellar> {
-    return cellarTable.create(
+    const quantity = batchMap.value[payload.batchId]?.quantity ?? 0
+    const spoilCount = Math.max(Math.round(payload.spoilCount ?? 0), 0)
+    const state = payload.state ?? '窖藏中'
+    const cellar = await cellarTable.create(
       {
         batchId: payload.batchId,
         startDate: payload.startDate,
@@ -226,58 +257,132 @@ export const useCellarStore = defineStore('cellar', () => {
         temperatureC: round(payload.temperatureC, 1),
         humidityPct: round(payload.humidityPct, 1),
         container: payload.container,
-        state: payload.state ?? '窖藏中'
+        state,
+        spoilCount: state === '已出窖' ? Math.min(spoilCount, quantity) : 0,
+        spoilRatePct: 0
       },
       'cellar'
     )
+    // 入窖即把用料锁成当时那份；登记即已出窖的，同时按报废率回冲
+    await lockBatchUsage(cellar.batchId)
+    if (cellar.state === '已出窖') {
+      const rate = spoilRateOf(cellar, quantity)
+      await settleSpoil(cellar.batchId, rate, 0)
+      await cellarTable.update(cellar.id, { spoilRatePct: rate })
+    }
+    return cellar
   }
 
   async function updateCellar(id: string, patch: Partial<Cellar>): Promise<void> {
+    const cellar = cellarById(id)
+    if (!cellar) return
     const next: Partial<Cellar> = { ...patch }
     if (patch.temperatureC !== undefined) next.temperatureC = round(patch.temperatureC, 1)
     if (patch.humidityPct !== undefined) next.humidityPct = round(patch.humidityPct, 1)
+
+    const prevBatchId = cellar.batchId
+    const nextBatchId = patch.batchId ?? prevBatchId
+    const quantity = batchMap.value[nextBatchId]?.quantity ?? 0
+    if (patch.spoilCount !== undefined) {
+      next.spoilCount = Math.min(Math.max(Math.round(patch.spoilCount), 0), quantity)
+    }
+    const nextState = patch.state ?? cellar.state
+    const effectiveCellar: Cellar = { ...cellar, ...next, state: nextState, batchId: nextBatchId }
+    const prevRate = cellar.state === '已出窖' ? spoilRateOf(cellar) : 0
+    const nextRate =
+      nextState === '已出窖' ? spoilRateOf(effectiveCellar, quantity) : 0
+    next.spoilRatePct = nextRate
+
+    // 批次改挂：旧批次（若无其它窖藏）解锁恢复预留，新批次锁定
+    if (nextBatchId !== prevBatchId) {
+      await cellarTable.update(id, next)
+      await resyncBatchLock(prevBatchId)
+      await lockBatchUsage(nextBatchId)
+      if (nextState === '已出窖') await settleSpoil(nextBatchId, nextRate, 0)
+      return
+    }
+    if (nextState === '已出窖' || cellar.state === '已出窖') {
+      await settleSpoil(nextBatchId, nextRate, prevRate)
+    }
     await cellarTable.update(id, next)
   }
 
-  /** 状态流转：窖藏中 → 已出窖（可回退） */
+  /** 状态流转：窖藏中 → 已出窖（按报废数回冲库存），已出窖 → 窖藏中（把回冲领回） */
   async function advanceState(id: string): Promise<CellarState | null> {
     const cellar = cellarById(id)
     if (!cellar) return null
     const next = CELLAR_STATE_FLOW[cellar.state]
+    const quantity = batchMap.value[cellar.batchId]?.quantity ?? 0
     const patch: Partial<Cellar> = { state: next }
     if (next === '已出窖' && cellar.endDate > todayIso()) {
       patch.endDate = todayIso()
+    }
+    if (next === '已出窖') {
+      const rate = spoilRateOf(cellar, quantity)
+      await settleSpoil(cellar.batchId, rate, 0)
+      patch.spoilRatePct = rate
+    } else {
+      // 回退为在窖：出窖时退回库存的报废用料重新领回
+      await settleSpoil(cellar.batchId, 0, spoilRateOf(cellar, quantity))
+      patch.spoilCount = 0
+      patch.spoilRatePct = 0
     }
     await cellarTable.update(id, patch)
     return next
   }
 
   async function setState(id: string, state: CellarState): Promise<void> {
-    await cellarTable.update(id, { state })
+    const cellar = cellarById(id)
+    if (!cellar || cellar.state === state) return
+    await updateCellar(id, { state })
   }
 
-  /** 一键出窖：把全部逾期的在窖批次置为已出窖 */
+  /** 出窖后补登 / 改报废数：按报废率增量回冲库存 */
+  async function setSpoilCount(id: string, spoilCount: number): Promise<void> {
+    await updateCellar(id, { spoilCount })
+  }
+
+  /** 一键出窖：把全部逾期的在窖批次置为已出窖（无报废登记，锁定用料维持消耗不回冲） */
   async function releaseOverdue(): Promise<number> {
     const targets = rows.value.filter((row) => row.cellar.state === '窖藏中' && row.remainDays < 0)
     if (targets.length === 0) return 0
     const now = Date.now()
     await db.transaction('rw', db.cellars, async () => {
       for (const row of targets) {
-        await db.cellars.update(row.cellar.id, { state: '已出窖', updatedAt: now })
+        await db.cellars.update(row.cellar.id, {
+          state: '已出窖',
+          endDate: todayIso(),
+          spoilCount: 0,
+          spoilRatePct: 0,
+          updatedAt: now
+        })
       }
     })
     return targets.length
   }
 
   async function removeCellar(id: string): Promise<void> {
+    const cellar = cellarById(id)
+    if (!cellar) return
+    const { batchId, state } = cellar
+    const quantity = batchMap.value[batchId]?.quantity ?? 0
+    // 已出窖且登记过报废：先把回冲进库存的料领回，再删记录
+    if (state === '已出窖') {
+      await settleSpoil(batchId, 0, spoilRateOf(cellar, quantity))
+    }
     await cellarTable.remove(id)
+    await resyncBatchLock(batchId)
     if (currentCellarId.value === id) currentCellarId.value = null
   }
 
   async function removeCellarsOfBatch(batchId: string): Promise<number> {
-    const ids = cellarsOfBatch(batchId).map((cellar) => cellar.id)
+    const list = cellarsOfBatch(batchId)
+    const ids = list.map((cellar) => cellar.id)
     if (ids.length === 0) return 0
+    const settled = list.some((cellar) => cellar.state === '已出窖' && spoilRateOf(cellar) > 0)
+    if (settled) await settleSpoil(batchId, 0, Math.max(...list.map((cellar) => spoilRateOf(cellar))))
     await cellarTable.bulkRemove(ids)
+    await unlockBatchUsage(batchId)
     return ids.length
   }
 
@@ -314,6 +419,8 @@ export const useCellarStore = defineStore('cellar', () => {
     updateCellar,
     advanceState,
     setState,
+    setSpoilCount,
+    spoilRateOf,
     releaseOverdue,
     removeCellar,
     removeCellarsOfBatch

@@ -5,6 +5,7 @@ import { useFormulaStore } from '@/stores/formulaStore'
 import { useMaterialStore } from '@/stores/materialStore'
 import type { Proportion, ProportionRole } from '@/types/proportion'
 import type { Material, MaterialGrade, ProcessMethod } from '@/types/material'
+import type { Batch } from '@/types/batch'
 import {
   applyManualOrder,
   checkRatioTotal,
@@ -15,6 +16,7 @@ import {
   scaleRatios,
   sortByRoleWeight
 } from '@/utils/ratio'
+import { recalcReservationsForFormula } from '@/utils/materialLedger'
 
 export interface UseProportionOptions {
   /** 仅在该香方下操作；不传则使用 formulaStore 的当前香方 */
@@ -54,6 +56,8 @@ export interface UseProportionResult {
   checkMessage: ComputedRef<string>
   loading: Ref<boolean>
   error: Ref<string | null>
+  /** 改方后因库存不足没能重算预留的批次（保留原预留，待补库存后再改） */
+  recalcRejected: Ref<Batch[]>
   add: (payload: ProportionFormPayload) => Promise<Proportion>
   update: (id: string, patch: Partial<ProportionFormPayload>) => Promise<void>
   remove: (id: string) => Promise<void>
@@ -132,6 +136,28 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
   watch(total, () => {
     void syncFormulaTotal()
   })
+
+  /**
+   * 香方配比一变，未入窖批次的预留跟着重算（已入窖的锁成当时那份，不动）。
+   * 防抖等拖拽 / 连改结束；库存撑不住的批次保留原预留，由页面提示。
+   */
+  const recalcRejected = ref<Batch[]>([])
+  let recalcTimer: ReturnType<typeof setTimeout> | null = null
+  watch(
+    () => proportionStore.proportionsByFormula(formulaId.value ?? '').map((item) => `${item.id}:${item.materialId}:${item.ratio}`).join('|'),
+    () => {
+      const id = formulaId.value
+      if (!id) return
+      if (recalcTimer) clearTimeout(recalcTimer)
+      recalcTimer = setTimeout(() => {
+        recalcReservationsForFormula(id)
+          .then((rejected) => {
+            recalcRejected.value = rejected
+          })
+          .catch(() => undefined)
+      }, 250)
+    }
+  )
 
   function nextSeq(id: string): number {
     const list = proportionStore.proportionsByFormula(id)
@@ -256,6 +282,7 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
     checkMessage,
     loading,
     error,
+    recalcRejected,
     add,
     update,
     remove,

@@ -16,7 +16,7 @@ import {
   type ScentType,
   type UsageScene
 } from '@/types/formula'
-import { MATERIAL_GRADES, PROCESS_METHODS, type Material, type MaterialGrade, type ProcessMethod } from '@/types/material'
+import { MATERIAL_GRADES, MATERIAL_UNITS, PROCESS_METHODS, type Material, type MaterialGrade, type MaterialUnit, type ProcessMethod } from '@/types/material'
 import { PROPORTION_ROLES, type Proportion, type ProportionRole } from '@/types/proportion'
 import { FORMING_METHODS, type Batch, type FormingMethod } from '@/types/batch'
 import { CELLAR_CONTAINERS, CELLAR_STATES, type Cellar, type CellarState, type CellarContainer } from '@/types/cellar'
@@ -44,6 +44,7 @@ export interface ValidateResult<T> {
 }
 
 const MATERIAL_GRADE_SET = new Set<string>(MATERIAL_GRADES)
+const MATERIAL_UNIT_SET = new Set<string>(MATERIAL_UNITS)
 const PROCESS_METHOD_SET = new Set<string>(PROCESS_METHODS)
 const SCENT_TYPE_SET = new Set<string>(SCENT_TYPES)
 const USAGE_SET = new Set<string>(USAGE_SCENES)
@@ -205,6 +206,11 @@ function parseMaterial(raw: unknown, errors: string[], index: number): Material 
     errors.push(`materials[${index}] processMethod 取值非法：${raw.processMethod}`)
     return null
   }
+  if (typeof raw.unit === 'string' && !MATERIAL_UNIT_SET.has(raw.unit)) {
+    errors.push(`materials[${index}] unit 取值非法：${raw.unit}`)
+    return null
+  }
+  const stock = asNumber(raw.stock, 0)
   return {
     id: asString(raw.id, createId('material')),
     name,
@@ -212,8 +218,33 @@ function parseMaterial(raw: unknown, errors: string[], index: number): Material 
     grade: pickEnum<MaterialGrade>(raw.grade, MATERIAL_GRADE_SET, '二级'),
     processMethod: pickEnum<ProcessMethod>(raw.processMethod, PROCESS_METHOD_SET, '生用'),
     aromaNote: asString(raw.aromaNote),
+    stock: stock > 0 ? stock : 0,
+    unit: pickEnum<MaterialUnit>(raw.unit, MATERIAL_UNIT_SET, 'g'),
     createdAt: asString(raw.createdAt, new Date().toISOString().slice(0, 10)),
     updatedAt: asNumber(raw.updatedAt, Date.now())
+  }
+}
+
+/** 解析批次用料账：老版导出文件没有该字段，返回空账待核对 */
+function parseLedger(raw: unknown): Batch['materialUsage'] {
+  const empty = { basisPerUnit: 1, items: [] }
+  if (!isRecord(raw)) return empty
+  if (!Array.isArray(raw.items)) return empty
+  return {
+    basisPerUnit: asNumber(raw.basisPerUnit, 1),
+    items: raw.items.filter(isRecord).map((item) => ({
+      materialId: asString(item.materialId),
+      materialName: asString(item.materialName, '未知香料'),
+      ratio: asNumber(item.ratio, 0),
+      role: asString(item.role, '君'),
+      requiredAmount: asNumber(item.requiredAmount, 0),
+      unit: asString(item.unit),
+      locked: Boolean(item.locked),
+      pending: Boolean(item.pending),
+      writeBackAmount: Number.isFinite(Number(item.writeBackAmount)) ? asNumber(item.writeBackAmount, 0) : undefined,
+      spoilAmount: Number.isFinite(Number(item.spoilAmount)) ? asNumber(item.spoilAmount, 0) : undefined,
+      writeBackRatePct: Number.isFinite(Number(item.writeBackRatePct)) ? asNumber(item.writeBackRatePct, 0) : undefined
+    }))
   }
 }
 
@@ -308,6 +339,7 @@ export function validateFormulaJson(input: unknown): ValidateResult<FormulaExpor
           }))
         : [],
       snapshotAt: asNumber(raw.snapshotAt, 0),
+      materialUsage: parseLedger(raw.materialUsage),
       updatedAt: asNumber(raw.updatedAt, Date.now())
     })
   })
@@ -338,6 +370,8 @@ export function validateFormulaJson(input: unknown): ValidateResult<FormulaExpor
       humidityPct: asNumber(raw.humidityPct, 60),
       container: pickEnum<CellarContainer>(raw.container, CELLAR_CONTAINER_SET, '陶罐'),
       state: pickEnum<CellarState>(raw.state, CELLAR_STATE_SET, '窖藏中'),
+      spoilCount: Math.max(asNumber(raw.spoilCount, 0), 0),
+      spoilRatePct: Math.max(asNumber(raw.spoilRatePct, 0), 0),
       updatedAt: asNumber(raw.updatedAt, Date.now())
     })
   })
@@ -442,6 +476,13 @@ export async function importFormulaPayload(
         ...item,
         materialId: materialIdMap.get(item.materialId) ?? item.materialId
       })),
+      materialUsage: {
+        basisPerUnit: batch.materialUsage?.basisPerUnit ?? 1,
+        items: (batch.materialUsage?.items ?? []).map((item) => ({
+          ...item,
+          materialId: materialIdMap.get(item.materialId) ?? item.materialId
+        }))
+      },
       updatedAt: now
     }
   })
