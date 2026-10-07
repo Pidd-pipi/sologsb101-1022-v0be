@@ -228,10 +228,11 @@ export const useFormulaStore = defineStore('formula', () => {
     const tastingIds = batchIds.length > 0 ? await db.tastings.where('batchId').anyOf(batchIds).primaryKeys() : []
     await db.transaction(
       'rw',
-      [db.formulas, db.proportions, db.batches, db.cellars, db.tastings],
+      [db.formulas, db.proportions, db.batches, db.cellars, db.tastings, db.stockLines],
       async () => {
         await db.tastings.bulkDelete(tastingIds)
         await db.cellars.bulkDelete(cellarIds)
+        await db.stockLines.where('formulaId').equals(id).delete()
         await db.batches.bulkDelete(batchIds)
         await db.proportions.bulkDelete(proportionIds)
         await db.formulas.delete(id)

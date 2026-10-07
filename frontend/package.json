@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
-    "preview": "vite preview --port 22822"
+    "preview": "vite preview --port 22822",
+    "verify:stock": "esbuild scripts/verify-stock.ts --bundle --platform=node --format=esm --alias:@=./src --outfile=node_modules/.cache/verify-stock.mjs && node node_modules/.cache/verify-stock.mjs"
   },
   "dependencies": {
     "@element-plus/icons-vue": "^2.3.1",
@@ -19,6 +20,7 @@
   "devDependencies": {
     "@types/node": "^22.10.2",
     "@vitejs/plugin-vue": "^5.2.1",
+    "fake-indexeddb": "^6.2.5",
     "typescript": "~5.7.3",
     "vite": "^6.1.0",
     "vue-tsc": "^2.2.0"

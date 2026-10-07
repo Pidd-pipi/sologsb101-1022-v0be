@@ -18,6 +18,12 @@ export interface Cellar {
   container: CellarContainer
   /** 状态：窖藏中/已出窖 */
   state: CellarState
+  /** 出窖是否报废（出窖登记为报废时为 true，用料按损耗回冲库存） */
+  scrapped?: boolean
+  /** 报损比例（0~100，占锁定用料的百分比）；未报废为 0 */
+  wastePct?: number
+  /** 报废日期（ISO 日期串）；未报废为空串 */
+  scrappedAt?: string
   updatedAt: number
 }
 

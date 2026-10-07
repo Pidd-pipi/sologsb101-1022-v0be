@@ -12,6 +12,7 @@ import { useFormulaStore } from '@/stores/formulaStore'
 import {
   MATERIAL_GRADES,
   PROCESS_METHODS,
+  STOCK_UNIT,
   type Material,
   type MaterialGrade,
   type MaterialFilterState,
@@ -34,6 +35,7 @@ const form = reactive<{
   grade: MaterialGrade
   processMethod: ProcessMethod
   aromaNote: string
+  stock: number
   createdAt: string
 }>({
   name: '',
@@ -41,6 +43,7 @@ const form = reactive<{
   grade: '一级',
   processMethod: '生用',
   aromaNote: '',
+  stock: 0,
   createdAt: new Date().toISOString().slice(0, 10)
 })
 
@@ -141,6 +144,7 @@ function openCreate(): void {
   form.grade = '一级'
   form.processMethod = '生用'
   form.aromaNote = ''
+  form.stock = 0
   form.createdAt = new Date().toISOString().slice(0, 10)
   dialogVisible.value = true
 }
@@ -152,6 +156,7 @@ function openEdit(material: Material): void {
   form.grade = material.grade
   form.processMethod = material.processMethod
   form.aromaNote = material.aromaNote
+  form.stock = typeof material.stock === 'number' ? material.stock : 0
   form.createdAt = material.createdAt
   dialogVisible.value = true
 }
@@ -169,9 +174,12 @@ async function submitForm(): Promise<void> {
         grade: form.grade,
         processMethod: form.processMethod,
         aromaNote: form.aromaNote.trim(),
+        stock: Math.max(0, Math.round(form.stock * 100) / 100),
         createdAt: form.createdAt
       })
-      ElMessage.success('香料信息已更新')
+      // 人工核对保存后清掉升级补出的推断标记
+      await materialStore.updateMaterial(editingId.value, { stockInferred: false })
+      ElMessage.success('香料信息与库存已更新')
     } else {
       await materialStore.createMaterial({
         name: form.name,
@@ -179,9 +187,10 @@ async function submitForm(): Promise<void> {
         grade: form.grade,
         processMethod: form.processMethod,
         aromaNote: form.aromaNote,
+        stock: form.stock,
         createdAt: form.createdAt
       })
-      ElMessage.success(`已入库香料「${form.name.trim()}」`)
+      ElMessage.success(`已入库香料「${form.name.trim()}」，库存 ${form.stock}${STOCK_UNIT}`)
     }
     dialogVisible.value = false
   } finally {
@@ -207,7 +216,7 @@ async function removeMaterial(row: MaterialRow): Promise<void> {
   }).catch(() => false)
   if (!confirmed) return
   const result = await materialStore.removeMaterial(row.material.id)
-  ElMessage.success(`已删除香料，连带清除配比 ${result.proportions} 条`)
+  ElMessage.success(`已删除香料，连带清除配比 ${result.proportions} 条、用料台账 ${result.stockLines} 条`)
 }
 
 async function removeUnused(): Promise<void> {
@@ -312,6 +321,20 @@ function consumedBy(row: MaterialRow): string {
             </div>
           </template>
         </el-table-column>
+        <el-table-column label="库存账（克）" min-width="200">
+          <template #default="{ row }: { row: MaterialRow }">
+            <div class="cell-sub">
+              库存 <span class="mono">{{ row.stock }}</span> · 可用
+              <span class="mono" :class="row.available < 0 ? 'stock-negative' : 'stock-ok'">{{ row.available }}</span>
+              <el-tooltip v-if="row.inferred" content="老档案缺库存数，升级时按现有预留补出，请核对" placement="top">
+                <el-tag size="small" type="warning" effect="plain" round class="stock-tag">待核对</el-tag>
+              </el-tooltip>
+            </div>
+            <div class="cell-sub muted">
+              预留 {{ row.reserved }} · 锁定 {{ row.locked }}<template v-if="row.wasted > 0"> · 报损 {{ row.wasted }}</template>
+            </div>
+          </template>
+        </el-table-column>
         <el-table-column label="入库日期" prop="material.createdAt" width="120" />
         <el-table-column label="操作" width="170" fixed="right">
           <template #default="{ row }: { row: MaterialRow }">
@@ -339,6 +362,10 @@ function consumedBy(row: MaterialRow): string {
           <el-select v-model="form.processMethod" style="width: 100%">
             <el-option v-for="item in PROCESS_METHODS" :key="item" :label="item" :value="item" />
           </el-select>
+        </el-form-item>
+        <el-form-item label="本地库存">
+          <el-input-number v-model="form.stock" :min="0" :max="999999" :step="50" :precision="1" style="width: 200px" />
+          <span class="muted form-hint">{{ STOCK_UNIT }}（开批先按此余量预留，撑不住整批拒绝）</span>
         </el-form-item>
         <el-form-item label="香气特征" prop="aromaNote">
           <el-input
@@ -386,5 +413,24 @@ function consumedBy(row: MaterialRow): string {
 .cell-sub {
   font-size: 12px;
   line-height: 1.6;
+}
+
+.form-hint {
+  margin-left: 10px;
+  font-size: 12px;
+}
+
+.stock-ok {
+  color: var(--el-color-success);
+  font-weight: 600;
+}
+
+.stock-negative {
+  color: var(--el-color-danger);
+  font-weight: 600;
+}
+
+.stock-tag {
+  margin-left: 6px;
 }
 </style>

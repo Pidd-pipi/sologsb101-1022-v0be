@@ -1,3 +1,5 @@
+import type { StockLine } from '@/types/stock'
+
 /** 和香批次：一次实际的配料与成型作业 */
 export type FormingMethod = '挤条' | '手搓' | '压模' | '炼蜜成丸'
 
@@ -43,6 +45,8 @@ export interface BatchRow {
   /** 是否已进入窖藏 */
   cellared: boolean
   cellarState: string
+  /** 用料台账行（预留/锁定/报损），缺配比时为空 */
+  stockLines: StockLine[]
 }
 
 /** 批次筛选条件 */

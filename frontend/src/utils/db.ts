@@ -5,9 +5,11 @@ import type { Proportion } from '@/types/proportion'
 import type { Batch } from '@/types/batch'
 import type { Cellar } from '@/types/cellar'
 import type { Tasting } from '@/types/tasting'
+import type { StockLine } from '@/types/stock'
+import { calcAmount, stockLineId, type StockLineStatus } from '@/types/stock'
 
 /** 本地结构版本号：新增/修改表结构时必须递增，并补充 upgrade 迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 本地存储键名（localStorage 侧的少量元数据） */
 export const LS_KEYS = {
@@ -42,6 +44,7 @@ export interface IncenseSnapshot {
   batches: Batch[]
   cellars: Cellar[]
   tastings: Tasting[]
+  stockLines: StockLine[]
 }
 
 export class IncenseDatabase extends Dexie {
@@ -51,9 +54,10 @@ export class IncenseDatabase extends Dexie {
   batches!: Table<Batch, string>
   cellars!: Table<Cellar, string>
   tastings!: Table<Tasting, string>
+  stockLines!: Table<StockLine, string>
 
-  constructor() {
-    super('gbincense')
+  constructor(databaseName = 'gbincense') {
+    super(databaseName)
     // v1：初版表结构，配比表尚未建立 seq 编排字段索引
     this.version(1).stores({
       formulas: 'id, name, scentType, usage, state, totalRatio',
@@ -108,10 +112,112 @@ export class IncenseDatabase extends Dexie {
             }
           })
       })
+    // v3：香料库加 stock 库存容量、新增 stockLines 用料台账，把香料库/配比/批次并成一条用料账
+    this.version(DB_VERSION)
+      .stores({
+        formulas: 'id, name, scentType, usage, state, createdAt, totalRatio, updatedAt',
+        materials: 'id, name, origin, grade, processMethod, updatedAt',
+        proportions: 'id, formulaId, materialId, role, seq, updatedAt',
+        batches: 'id, formulaId, mixedAt, formingMethod, updatedAt',
+        cellars: 'id, batchId, startDate, endDate, state, updatedAt',
+        tastings: 'id, batchId, tastedAt, smokeScore, updatedAt',
+        stockLines: 'id, batchId, formulaId, materialId, status, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        const [materials, proportions, batches, cellars] = await Promise.all([
+          tx.table<Material>('materials').toArray(),
+          tx.table<Proportion>('proportions').toArray(),
+          tx.table<Batch>('batches').toArray(),
+          tx.table<Cellar>('cellars').toArray()
+        ])
+        const now = Date.now()
+        const materialMap = new Map(materials.map((material) => [material.id, material]))
+
+        // 迁移 1：老档案缺库存数。先按「现有批次折算的预留 + 已入窖锁定」汇总每味料的占用，
+        // 把库存补成恰好盖住占用的值并打 stockInferred 标记，待人工核对；没有占用的补 0。
+        const proportionMap = new Map(
+          proportions.map((proportion) => [`${proportion.formulaId}__${proportion.materialId}`, proportion])
+        )
+        const occupiedByMaterial = new Map<string, number>()
+        const cellaredBatchIds = new Set(
+          cellars.filter((cellar) => cellar.state === '窖藏中' || cellar.state === '已出窖').map((cellar) => cellar.batchId)
+        )
+        const scrappedBatchIds = new Set(
+          cellars.filter((cellar) => cellar.state === '已出窖' && cellar.scrapped).map((cellar) => cellar.batchId)
+        )
+        const stockRows: StockLine[] = []
+        batches.forEach((batch) => {
+          const snapshotItems = Array.isArray(batch.snapshot) ? batch.snapshot : []
+          // 老档案可能缺配比快照：缺配比的批次先留空（不建台账），待核对
+          snapshotItems.forEach((item) => {
+            const proportion = proportionMap.get(`${batch.formulaId}__${item.materialId}`)
+            // 已入窖批次锁成当时那份（用快照）；未入窖的优先用当前配比，缺配比则回退快照
+            const ratio = cellaredBatchIds.has(batch.id)
+              ? item.ratio
+              : proportion?.ratio ?? item.ratio
+            const amount = calcAmount(batch.quantity, ratio)
+            const isScrapped = scrappedBatchIds.has(batch.id)
+            const isLocked = cellaredBatchIds.has(batch.id)
+            const status: StockLine['status'] = isScrapped ? 'wasted' : isLocked ? 'locked' : 'reserved'
+            occupiedByMaterial.set(
+              item.materialId,
+              (occupiedByMaterial.get(item.materialId) ?? 0) + (status === 'wasted' ? 0 : amount)
+            )
+            const material = materialMap.get(item.materialId)
+            stockRows.push({
+              id: stockLineId(batch.id, item.materialId),
+              batchId: batch.id,
+              formulaId: batch.formulaId,
+              materialId: item.materialId,
+              materialName: material?.name ?? item.materialName ?? '未知香料',
+              ratio: Math.round(ratio * 100) / 100,
+              quantity: batch.quantity,
+              amount,
+              status,
+              lockedAt: isLocked ? batch.snapshotAt || now : 0,
+              wastedAmount: 0,
+              wastePct: 0,
+              wastedAt: 0,
+              updatedAt: now
+            })
+          })
+        })
+
+        // 老档案缺库存数：按现有预留/锁定补出来，并标记为待核对的推断值
+        await tx
+          .table<Material>('materials')
+          .toCollection()
+          .modify((material) => {
+            if (typeof material.stock !== 'number' || Number.isNaN(material.stock)) {
+              const inferred = Math.ceil((occupiedByMaterial.get(material.id) ?? 0) * 100) / 100
+              material.stock = inferred
+              ;(material as Material & { stockInferred?: boolean }).stockInferred = inferred > 0
+              material.updatedAt = now
+            }
+          })
+
+        // 迁移 2：窖藏补齐报废相关字段，避免出窖回冲读到 undefined
+        await tx
+          .table<Cellar>('cellars')
+          .toCollection()
+          .modify((cellar) => {
+            if (typeof cellar.scrapped !== 'boolean') cellar.scrapped = false
+            if (typeof cellar.wastePct !== 'number') cellar.wastePct = 0
+            if (typeof cellar.scrappedAt !== 'string') cellar.scrappedAt = ''
+          })
+
+        // 迁移 3：写入按现有批次补出的用料台账
+        if (stockRows.length > 0) {
+          await tx.table<StockLine>('stockLines').bulkPut(stockRows)
+        }
+      })
   }
 }
 
-export const db = new IncenseDatabase()
+export const db = new IncenseDatabase(
+  // 仅用于自动化验证：脚本可通过全局变量指定独立库名，跑 v2→v3 迁移
+  (globalThis as { __GBINCENSE_DB_NAME__?: string }).__GBINCENSE_DB_NAME__ ?? 'gbincense'
+)
 
 /** 生成主键：短前缀 + 时间戳 + 随机串，避免多标签页写入冲突 */
 export function createId(prefix: string): string {
@@ -123,7 +229,7 @@ export function createId(prefix: string): string {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.formulas, db.materials, db.proportions, db.batches, db.cellars, db.tastings],
+    [db.formulas, db.materials, db.proportions, db.batches, db.cellars, db.tastings, db.stockLines],
     async () => {
       await Promise.all([
         db.formulas.clear(),
@@ -131,7 +237,8 @@ export async function clearAllTables(): Promise<void> {
         db.proportions.clear(),
         db.batches.clear(),
         db.cellars.clear(),
-        db.tastings.clear()
+        db.tastings.clear(),
+        db.stockLines.clear()
       ])
     }
   )
@@ -139,15 +246,16 @@ export async function clearAllTables(): Promise<void> {
 
 /** 各表记录数汇总，品香页与状态徽标消费 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [formulas, materials, proportions, batches, cellars, tastings] = await Promise.all([
+  const [formulas, materials, proportions, batches, cellars, tastings, stockLines] = await Promise.all([
     db.formulas.count(),
     db.materials.count(),
     db.proportions.count(),
     db.batches.count(),
     db.cellars.count(),
-    db.tastings.count()
+    db.tastings.count(),
+    db.stockLines.count()
   ])
-  return { formulas, materials, proportions, batches, cellars, tastings }
+  return { formulas, materials, proportions, batches, cellars, tastings, stockLines }
 }
 
 /** 读取 localStorage 中的 UI 偏好 */
@@ -192,13 +300,14 @@ export function readLastBackupAt(): string | null {
 
 /** 组装本地全部数据的快照对象 */
 export async function exportSnapshot(): Promise<IncenseSnapshot> {
-  const [formulas, materials, proportions, batches, cellars, tastings] = await Promise.all([
+  const [formulas, materials, proportions, batches, cellars, tastings, stockLines] = await Promise.all([
     db.formulas.toArray(),
     db.materials.toArray(),
     db.proportions.toArray(),
     db.batches.toArray(),
     db.cellars.toArray(),
-    db.tastings.toArray()
+    db.tastings.toArray(),
+    db.stockLines.toArray()
   ])
   return {
     app: 'gbincense',
@@ -209,7 +318,8 @@ export async function exportSnapshot(): Promise<IncenseSnapshot> {
     proportions,
     batches,
     cellars,
-    tastings
+    tastings,
+    stockLines
   }
 }
 
@@ -218,7 +328,7 @@ export async function importSnapshot(snapshot: IncenseSnapshot, overwrite = fals
   if (overwrite) await clearAllTables()
   await db.transaction(
     'rw',
-    [db.formulas, db.materials, db.proportions, db.batches, db.cellars, db.tastings],
+    [db.formulas, db.materials, db.proportions, db.batches, db.cellars, db.tastings, db.stockLines],
     async () => {
       await db.formulas.bulkPut(snapshot.formulas)
       await db.materials.bulkPut(snapshot.materials)
@@ -226,6 +336,7 @@ export async function importSnapshot(snapshot: IncenseSnapshot, overwrite = fals
       await db.batches.bulkPut(snapshot.batches)
       await db.cellars.bulkPut(snapshot.cellars)
       await db.tastings.bulkPut(snapshot.tastings)
+      if (Array.isArray(snapshot.stockLines)) await db.stockLines.bulkPut(snapshot.stockLines)
     }
   )
 }
@@ -312,6 +423,7 @@ export async function seedDatabase(): Promise<void> {
       grade: '特级',
       processMethod: '生用',
       aromaNote: '清甜带凉，尾韵有蔗糖气',
+      stock: 1000,
       createdAt: '2024-02-18',
       updatedAt: now
     },
@@ -322,6 +434,7 @@ export async function seedDatabase(): Promise<void> {
       grade: '特级',
       processMethod: '酒蒸',
       aromaNote: '奶香厚重，留香绵长',
+      stock: 800,
       createdAt: '2024-02-20',
       updatedAt: now
     },
@@ -332,6 +445,7 @@ export async function seedDatabase(): Promise<void> {
       grade: '一级',
       processMethod: '醋浸',
       aromaNote: '树脂清香，微带柑橘前调',
+      stock: 500,
       createdAt: '2024-04-02',
       updatedAt: now
     },
@@ -342,6 +456,7 @@ export async function seedDatabase(): Promise<void> {
       grade: '二级',
       processMethod: '炒黄',
       aromaNote: '辛香穿透，少许即显',
+      stock: 300,
       createdAt: '2024-04-06',
       updatedAt: now
     }
@@ -414,6 +529,9 @@ export async function seedDatabase(): Promise<void> {
       humidityPct: 58,
       container: '陶罐',
       state: '窖藏中',
+      scrapped: false,
+      wastePct: 0,
+      scrappedAt: '',
       updatedAt: now
     },
     {
@@ -425,8 +543,43 @@ export async function seedDatabase(): Promise<void> {
       humidityPct: 62,
       container: '锡罐',
       state: '已出窖',
+      scrapped: false,
+      wastePct: 0,
+      scrappedAt: '',
       updatedAt: now
     }
+  ]
+
+  // 用料台账：两个播种批次都已入窖，用料锁成开批那份（用快照折料）
+  const buildStockLines = (
+    batch: Batch,
+    rows: Array<[string, string, number, Proportion['role'], string]>,
+    status: StockLineStatus,
+    lockedAt: number
+  ): StockLine[] =>
+    rows.map((row) => {
+      const material = materials.find((item) => item.id === row[0])
+      const ratio = row[2]
+      return {
+        id: stockLineId(batch.id, row[0]),
+        batchId: batch.id,
+        formulaId: batch.formulaId,
+        materialId: row[0],
+        materialName: material?.name ?? '未知香料',
+        ratio,
+        quantity: batch.quantity,
+        amount: calcAmount(batch.quantity, ratio),
+        status,
+        lockedAt,
+        wastedAmount: 0,
+        wastePct: 0,
+        wastedAt: 0,
+        updatedAt: now
+      }
+    })
+  const stockLines: StockLine[] = [
+    ...buildStockLines(batches[0], lineRatio, 'locked', new Date('2024-04-05T09:00:00').getTime()),
+    ...buildStockLines(batches[1], pillRatio, 'locked', new Date('2024-06-20T10:00:00').getTime())
   ]
 
   const tastings: Tasting[] = [
@@ -454,7 +607,7 @@ export async function seedDatabase(): Promise<void> {
 
   await db.transaction(
     'rw',
-    [db.formulas, db.materials, db.proportions, db.batches, db.cellars, db.tastings],
+    [db.formulas, db.materials, db.proportions, db.batches, db.cellars, db.tastings, db.stockLines],
     async () => {
       await db.formulas.bulkPut(formulas)
       await db.materials.bulkPut(materials)
@@ -462,6 +615,7 @@ export async function seedDatabase(): Promise<void> {
       await db.batches.bulkPut(batches)
       await db.cellars.bulkPut(cellars)
       await db.tastings.bulkPut(tastings)
+      await db.stockLines.bulkPut(stockLines)
     }
   )
 }

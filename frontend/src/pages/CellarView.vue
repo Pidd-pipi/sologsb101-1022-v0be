@@ -9,10 +9,12 @@ import GradeTag from '@/components/common/GradeTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import { useCellarStore, parseDate } from '@/stores/cellarStore'
 import { useFormulaStore } from '@/stores/formulaStore'
+import { useStockStore } from '@/stores/stockStore'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { useProportion } from '@/hooks/useProportion'
 import { db } from '@/utils/db'
 import { round } from '@/utils/ratio'
+import { STOCK_UNIT } from '@/types/stock'
 import {
   CELLAR_CONTAINERS,
   CELLAR_NEAR_DAYS,
@@ -31,6 +33,7 @@ const route = useRoute()
 const router = useRouter()
 const cellarStore = useCellarStore()
 const formulaStore = useFormulaStore()
+const stockStore = useStockStore()
 const batchTable = useIdbTable<Batch>((database) => database.batches, { sortByUpdatedAt: false })
 const proportionTable = useIdbTable<Proportion>((database) => database.proportions, { sortByUpdatedAt: false })
 
@@ -38,6 +41,12 @@ const dialogVisible = ref(false)
 const submitting = ref(false)
 const editingId = ref<string | null>(null)
 const formRef = ref<FormInstance>()
+
+/** 出窖报废对话框 */
+const scrapVisible = ref(false)
+const scrapTargetId = ref<string | null>(null)
+const scrapPct = ref(10)
+const scrapSubmitting = ref(false)
 
 
 const form = reactive<{
@@ -297,10 +306,47 @@ async function advanceState(row: CellarRow): Promise<void> {
   if (next) ElMessage.success(`「${row.formulaName}」已流转为「${next}」`)
 }
 
-async function setState(row: CellarRow, state: CellarState): Promise<void> {
-  if (row.cellar.state === state) return
-  await cellarStore.setState(row.cellar.id, state)
-  ElMessage.success(`已置为「${state}」`)
+/** 报废预览：该批锁定用料合计，按当前损耗比例折算损耗与完好退回 */
+const scrapPreview = computed(() => {
+  if (!scrapTargetId.value) return { total: 0, wasted: 0, returned: 0, lines: [] as Array<{ name: string; amount: number; wasted: number }> }
+  const cellar = cellarStore.cellarById(scrapTargetId.value)
+  if (!cellar) return { total: 0, wasted: 0, returned: 0, lines: [] }
+  const lines = stockStore.linesOfBatch(cellar.batchId).filter((line) => line.status !== 'reserved')
+  const detail = lines.map((line) => ({
+    name: line.materialName,
+    amount: line.amount,
+    wasted: round((line.amount * scrapPct.value) / 100, 2)
+  }))
+  const total = round(lines.reduce((sum, line) => sum + line.amount, 0), 2)
+  const wasted = round((total * scrapPct.value) / 100, 2)
+  return { total, wasted, returned: round(total - wasted, 2), lines: detail }
+})
+
+function openScrap(row: CellarRow): void {
+  scrapTargetId.value = row.cellar.id
+  scrapPct.value = typeof row.cellar.wastePct === 'number' && row.cellar.wastePct > 0 ? row.cellar.wastePct : 10
+  scrapVisible.value = true
+}
+
+async function submitScrap(): Promise<void> {
+  if (!scrapTargetId.value) return
+  scrapSubmitting.value = true
+  try {
+    const result = await cellarStore.markScrap(scrapTargetId.value, true, scrapPct.value)
+    ElMessage.success(
+      `已按损耗回冲：报废损耗 ${result.wasted}${STOCK_UNIT}，完好退回库存 ${result.returned}${STOCK_UNIT}`
+    )
+    scrapVisible.value = false
+  } finally {
+    scrapSubmitting.value = false
+  }
+}
+
+/** 撤销报废：用料恢复为入窖锁定占用 */
+async function undoScrap(row: CellarRow): Promise<void> {
+  const result = await cellarStore.markScrap(row.cellar.id, false, 0)
+  void result
+  ElMessage.success('已撤销报废，该批用料恢复为入窖锁定占用')
 }
 
 async function updateReading(row: CellarRow, field: 'temperatureC' | 'humidityPct', value: number): Promise<void> {
@@ -483,15 +529,18 @@ const formingText = (batchId: string): FormingMethod | '—' =>
             />
           </template>
         </el-table-column>
-        <el-table-column label="容器 / 状态" width="170">
+        <el-table-column label="容器 / 状态" width="200">
           <template #default="{ row }: { row: CellarRow }">
             <GradeTag plain size="small" :label="row.cellar.container" />
             <el-tag class="state-tag" :type="urgencyTone(row.urgency)" effect="plain" round>
               {{ row.cellar.state }}
             </el-tag>
+            <el-tag v-if="row.cellar.scrapped" class="state-tag" type="danger" effect="dark" round size="small">
+              报废 {{ row.cellar.wastePct ?? 0 }}%
+            </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="270" fixed="right">
+        <el-table-column label="操作" width="360" fixed="right">
           <template #default="{ row }: { row: CellarRow }">
             <el-button
               size="small"
@@ -499,18 +548,12 @@ const formingText = (batchId: string): FormingMethod | '—' =>
               plain
               @click="advanceState(row)"
             >
-              {{ row.cellar.state === '窖藏中' ? '出窖' : '回退为在窖' }}
+              {{ row.cellar.state === '窖藏中' ? '正常出窖' : '回退为在窖' }}
             </el-button>
-            <el-dropdown trigger="click" @command="(command: string) => setState(row, command as CellarState)">
-              <el-button size="small">状态</el-button>
-              <template #dropdown>
-                <el-dropdown-menu>
-                  <el-dropdown-item v-for="state in CELLAR_STATES" :key="state" :command="state">
-                    {{ state }}
-                  </el-dropdown-item>
-                </el-dropdown-menu>
-              </template>
-            </el-dropdown>
+            <el-button size="small" type="danger" plain @click="openScrap(row)">
+              {{ row.cellar.scrapped ? '调整报废' : '出窖报废' }}
+            </el-button>
+            <el-button v-if="row.cellar.scrapped" size="small" text @click="undoScrap(row)">撤销报废</el-button>
             <el-button size="small" text @click="goTasting(row)">去品香</el-button>
             <el-button size="small" text type="primary" :icon="Edit" @click="openEdit(row.cellar)">编辑</el-button>
             <el-button size="small" text type="danger" :icon="Delete" @click="removeCellar(row)">删除</el-button>
@@ -579,6 +622,47 @@ const formingText = (batchId: string): FormingMethod | '—' =>
         </el-button>
       </template>
     </el-dialog>
+
+    <el-dialog v-model="scrapVisible" title="出窖报废登记（按损耗回冲用料）" width="560px" append-to-body>
+      <div v-if="scrapPreview.lines.length > 0">
+        <el-alert
+          type="warning"
+          :closable="false"
+          show-icon
+          title="报废批次的用料账整批转为报损：损耗部分记报废，未损部分退回可用库存"
+          class="ratio-alert"
+        />
+        <div class="scrap-row">
+          <span>损耗比例</span>
+          <el-slider v-model="scrapPct" :min="0" :max="100" :step="1" show-input style="flex: 1; margin-left: 16px" />
+        </div>
+        <div class="scrap-summary">
+          <StatBadge label="锁定用料" :value="scrapPreview.total" :suffix="STOCK_UNIT" size="small" icon="Coin" tone="primary" />
+          <StatBadge label="报废损耗" :value="scrapPreview.wasted" :suffix="STOCK_UNIT" size="small" icon="WarningFilled" tone="danger" />
+          <StatBadge label="完好退回" :value="scrapPreview.returned" :suffix="STOCK_UNIT" size="small" icon="Files" tone="success" />
+        </div>
+        <el-table :data="scrapPreview.lines" size="small" row-key="name" style="margin-top: 10px">
+          <el-table-column label="香料" prop="name" min-width="120" />
+          <el-table-column label="锁定用量" width="120">
+            <template #default="{ row }: { row: { amount: number } }">
+              <span class="mono">{{ row.amount }}{{ STOCK_UNIT }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="损耗" width="120">
+            <template #default="{ row }: { row: { wasted: number } }">
+              <span class="mono ratio-error">{{ row.wasted }}{{ STOCK_UNIT }}</span>
+            </template>
+          </el-table-column>
+        </el-table>
+      </div>
+      <el-empty v-else description="该批次没有锁定的用料台账（可能缺配比），无料可回冲" />
+      <template #footer>
+        <el-button @click="scrapVisible = false">取消</el-button>
+        <el-button type="danger" :loading="scrapSubmitting" :disabled="scrapPreview.lines.length === 0" @click="submitScrap">
+          确认报废并回冲
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -621,5 +705,18 @@ const formingText = (batchId: string): FormingMethod | '—' =>
 
 .ratio-alert {
   margin-bottom: 12px;
+}
+
+.scrap-row {
+  display: flex;
+  align-items: center;
+  margin: 8px 0;
+  font-size: 13px;
+}
+
+.scrap-summary {
+  display: flex;
+  gap: 8px;
+  margin: 10px 0;
 }
 </style>

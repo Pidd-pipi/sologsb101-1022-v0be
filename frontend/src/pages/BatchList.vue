@@ -10,10 +10,12 @@ import { useFormulaStore } from '@/stores/formulaStore'
 import { useMaterialStore } from '@/stores/materialStore'
 import { useProportionStore } from '@/stores/proportionStore'
 import { useCellarStore } from '@/stores/cellarStore'
+import { useStockStore } from '@/stores/stockStore'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { useProportion } from '@/hooks/useProportion'
 import { db } from '@/utils/db'
 import { round } from '@/utils/ratio'
+import { StockShortageError, STOCK_UNIT } from '@/types/stock'
 import {
   FORMING_METHODS,
   createEmptyBatchFilter,
@@ -30,6 +32,7 @@ const formulaStore = useFormulaStore()
 const materialStore = useMaterialStore()
 const proportionStore = useProportionStore()
 const cellarStore = useCellarStore()
+const stockStore = useStockStore()
 const batchTable = useIdbTable<Batch>((database) => database.batches)
 /** 用 useProportion 校验和香前的配比合计，避免用未平衡的方子开批次 */
 const { rows: selectedProportionRows, total: selectedRatioTotal, checkLevel, checkMessage } = useProportion()
@@ -148,6 +151,7 @@ const rows = computed<BatchRow[]>(() =>
       2
     )
     const cellars = cellarStore.cellarsOfBatch(batch.id)
+    const stockLines = stockStore.linesOfBatch(batch.id)
     return {
       batch,
       formulaName: formulaStore.formulaName(batch.formulaId),
@@ -155,7 +159,8 @@ const rows = computed<BatchRow[]>(() =>
       currentRatioTotal,
       snapshotRatioTotal,
       cellared: cellars.length > 0,
-      cellarState: cellars.length === 0 ? '未入窖' : cellars.map((cellar) => cellar.state).join(' / ')
+      cellarState: cellars.length === 0 ? '未入窖' : cellars.map((cellar) => cellar.state).join(' / '),
+      stockLines
     }
   })
 )
@@ -255,6 +260,40 @@ function openEdit(batch: Batch): void {
   dialogVisible.value = true
 }
 
+function shortageText(error: unknown): string {
+  if (error instanceof StockShortageError) {
+    return error.shortages.map((item) => `${item.materialName} 差 ${item.short}${STOCK_UNIT}`).join('；')
+  }
+  return error instanceof Error ? error.message : '库存核对失败'
+}
+
+/** 开批预留预览：按当前配比 × 数量折出每味料与库存缺口，供对话框实时展示 */
+const reservePreview = computed(() => {
+  if (!form.formulaId) return { items: [] as Array<{ name: string; amount: number; available: number; short: number }>, shortages: [] as Array<{ name: string; short: number }> }
+  const proportions = proportionStore.proportionsByFormula(form.formulaId)
+  const items = proportions.map((proportion) => {
+    const material = materialStore.materialById(proportion.materialId)
+    const occupancy = stockStore.occupancy(proportion.materialId)
+    const capacity = typeof material?.stock === 'number' ? material.stock : 0
+    const amount = round((form.quantity * proportion.ratio) / 100, 2)
+    // 编辑本批时，本批现有台账不计入占用
+    const selfLines = editingId.value ? stockStore.linesOfBatch(editingId.value) : []
+    const selfAmount = round(
+      selfLines.filter((line) => line.materialId === proportion.materialId).reduce((sum, line) => sum + line.amount, 0),
+      2
+    )
+    const available = round(capacity - (occupancy.occupied - selfAmount), 2)
+    return { name: material?.name ?? '未知香料', amount, available, short: round(amount - available, 2) }
+  })
+  const shortages = items.filter((item) => item.short > 0.01)
+  return { items, shortages }
+})
+
+/** 缺料提示文案：说清缺哪几味、差多少 */
+const shortageSummary = computed(() =>
+  reservePreview.value.shortages.map((item) => `${item.name} 差 ${item.short}${STOCK_UNIT}`).join('；')
+)
+
 async function submitForm(): Promise<void> {
   if (!formRef.value) return
   const valid = await formRef.value.validate().catch(() => false)
@@ -262,16 +301,70 @@ async function submitForm(): Promise<void> {
   submitting.value = true
   try {
     if (editingId.value) {
-      await batchTable.update(editingId.value, {
+      const batchId = editingId.value
+      // 已入窖批次用料锁死：香方、数量都不能改，只允许改日期/成型/制香人
+      const locked = stockStore.linesOfBatch(batchId).some((line) => line.status !== 'reserved')
+      const original = batchTable.rows.value.find((item) => item.id === batchId)
+      if (original && locked && (original.quantity !== form.quantity || original.formulaId !== form.formulaId)) {
+        ElMessage.error('该批次已入窖，用料锁成开批那份，香方与数量不能再改')
+        return
+      }
+      const formulaChanged = Boolean(original && original.formulaId !== form.formulaId)
+      const quantityChanged = Boolean(original && original.quantity !== form.quantity)
+      const needReserve = formulaChanged || quantityChanged
+
+      // 香方变了用新香方快照，数量变了沿用原快照；先算好新预留再决定是否落库
+      const newSnapshot = formulaChanged ? await buildSnapshot(form.formulaId) : original?.snapshot ?? []
+
+      if (needReserve && newSnapshot.length > 0 && original) {
+        try {
+          // 先按新值试算预留（事务内核对最新库存），成功后再改批次
+          await stockStore.resizeBatch({
+            batch: { id: batchId, formulaId: form.formulaId, quantity: original.quantity },
+            snapshot: newSnapshot,
+            quantity: form.quantity
+          })
+        } catch (error) {
+          // 库存撑不住：批次与预留都维持原样，表单留草稿，按最新余量重试
+          ElMessageBox.alert(
+            `库存撑不住，已整批拒绝并保持原批次与预留：${shortageText(error)}。表单已保留为草稿，可调小数量或补库存后重试。`,
+            '调整被拒绝',
+            { type: 'warning', confirmButtonText: '知道了' }
+          )
+          return
+        }
+      }
+
+      await db.batches.update(batchId, {
         formulaId: form.formulaId,
         mixedAt: form.mixedAt,
         formingMethod: form.formingMethod,
         quantity: form.quantity,
-        operator: form.operator.trim()
+        operator: form.operator.trim(),
+        // 换香方时快照一并换成新方的，缺配比则留空待核对
+        ...(formulaChanged ? { snapshot: newSnapshot, snapshotAt: Date.now() } : {})
       })
-      ElMessage.success('批次已更新')
+
+      // 换到一个没有配比的香方：清空该批台账，留空待核对
+      if (formulaChanged && newSnapshot.length === 0) {
+        await stockStore.removeLinesOfBatch(batchId)
+      }
+
+      if (quantityChanged && !formulaChanged) {
+        ElMessage.success('批次已更新，多占的用料已按实到退回、少占的已补占')
+      } else if (formulaChanged) {
+        ElMessage.success(
+          newSnapshot.length > 0 ? '批次已转到新香方，预留已按新配比重算' : '批次已转香方；新方缺配比，用料账留空待核对'
+        )
+      } else {
+        ElMessage.success('批次已更新')
+      }
     } else {
       const snapshot = await buildSnapshot(form.formulaId)
+      if (snapshot.length === 0) {
+        ElMessage.warning('该香方还没有配比，批次可先保存但用料账留空，待配比核对后再补预留')
+      }
+      // 先建批次再预留；预留失败（库存不足或被另一标签页抢先）则删除批次，整批拒绝
       const batch = await batchTable.create(
         {
           formulaId: form.formulaId,
@@ -284,7 +377,27 @@ async function submitForm(): Promise<void> {
         },
         'batch'
       )
-      ElMessage.success(`已生成批次，自动带出 ${snapshot.length} 条配比快照，便于追溯改方前后差异`)
+      if (snapshot.length > 0) {
+        try {
+          await stockStore.reserveForBatch({
+            batch: { id: batch.id, formulaId: form.formulaId, quantity: form.quantity },
+            snapshot
+          })
+          ElMessage.success(`已登记批次并按配比预留 ${snapshot.length} 味香料，库存撑不住时会整批拒绝`)
+        } catch (error) {
+          // 回滚刚建的批次，让该侧留草稿（对话框保留），按最新余量重试
+          await db.batches.delete(batch.id)
+          await stockStore.removeLinesOfBatch(batch.id)
+          ElMessageBox.alert(
+            `库存不足，本批已整批拒绝（未生成批次、未占库存）：${shortageText(error)}。表单已保留为草稿，请按最新余量调整后重试。`,
+            '领料被拒绝',
+            { type: 'error', confirmButtonText: '重试提交' }
+          )
+          return
+        }
+      } else {
+        ElMessage.success('已生成批次，配比留空待核对后补预留')
+      }
       detailBatchId.value = batch.id
     }
     dialogVisible.value = false
@@ -303,18 +416,42 @@ async function removeBatch(row: BatchRow): Promise<void> {
   if (!confirmed) return
   const cellarIds = cellars.map((cellar) => cellar.id)
   const tastingIds = await db.tastings.where('batchId').equals(row.batch.id).primaryKeys()
-  await db.transaction('rw', [db.batches, db.cellars, db.tastings], async () => {
-    await db.tastings.bulkDelete(tastingIds)
-    await db.cellars.bulkDelete(cellarIds)
-    await db.batches.delete(row.batch.id)
-  })
-  ElMessage.success(`已删除批次，连带清除窖藏 ${cellarIds.length} 条、品香 ${tastingIds.length} 条`)
+  await db.transaction(
+    'rw',
+    [db.batches, db.cellars, db.tastings, db.stockLines],
+    async () => {
+      await db.tastings.bulkDelete(tastingIds)
+      await db.cellars.bulkDelete(cellarIds)
+      await db.stockLines.where('batchId').equals(row.batch.id).delete()
+      await db.batches.delete(row.batch.id)
+    }
+  )
+  ElMessage.success(
+    `已删除批次，连带清除窖藏 ${cellarIds.length} 条、品香 ${tastingIds.length} 条，并释放全部预留/锁定用料`
+  )
 }
 
 async function refreshSnapshot(row: BatchRow): Promise<void> {
+  // 已入窖批次的用料锁成当时那份，只能重算快照文案，不能动台账
+  const locked = row.stockLines.some((line) => line.status !== 'reserved')
   const snapshot = await buildSnapshot(row.batch.formulaId)
   await batchTable.update(row.batch.id, { snapshot, snapshotAt: Date.now() })
-  ElMessage.success('已按当前配比重置快照')
+  if (!locked && snapshot.length > 0) {
+    try {
+      await stockStore.resizeBatch({
+        batch: { id: row.batch.id, formulaId: row.batch.formulaId, quantity: row.batch.quantity },
+        snapshot,
+        quantity: row.batch.quantity
+      })
+      ElMessage.success('已按当前配比重置快照并重算预留')
+    } catch (error) {
+      ElMessage.warning(`快照已重置，但库存撑不住新配比：${shortageText(error)}，台账维持原样`)
+    }
+  } else if (locked) {
+    ElMessage.success('已重置快照文案；该批次已入窖，用料锁成开批那份不变')
+  } else {
+    ElMessage.success('已按当前配比重置快照')
+  }
 }
 
 function openDetail(row: BatchRow): void {
@@ -330,6 +467,36 @@ function goCellar(row: BatchRow): void {
 function goProportion(row: BatchRow): void {
   formulaStore.setCurrentFormula(row.batch.formulaId)
   void router.push('/proportions')
+}
+
+/** 批次折料总量：非报废台账的 amount 合计（克） */
+function stockTotal(row: BatchRow): number {
+  return round(
+    row.stockLines.filter((line) => line.status !== 'wasted').reduce((sum, line) => sum + line.amount, 0),
+    2
+  )
+}
+
+/** 批次累计报损量（克） */
+function stockWasted(row: BatchRow): number {
+  return round(
+    row.stockLines
+      .filter((line) => line.status === 'wasted')
+      .reduce((sum, line) => sum + line.wastedAmount, 0),
+    2
+  )
+}
+
+function stockStatusLabel(row: BatchRow): string {
+  if (row.stockLines.some((line) => line.status === 'wasted')) return '出窖报损'
+  if (row.stockLines.some((line) => line.status === 'locked')) return '入窖锁定'
+  return '预留中'
+}
+
+function stockStatusTone(row: BatchRow): 'success' | 'warning' | 'info' {
+  if (row.stockLines.some((line) => line.status === 'wasted')) return 'warning'
+  if (row.stockLines.some((line) => line.status === 'locked')) return 'success'
+  return 'info'
 }
 </script>
 
@@ -391,6 +558,27 @@ function goProportion(row: BatchRow): void {
         <el-table-column label="数量" width="110">
           <template #default="{ row }: { row: BatchRow }">
             <span class="mono">{{ row.batch.quantity }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="用料账" min-width="170">
+          <template #default="{ row }: { row: BatchRow }">
+            <template v-if="row.stockLines.length > 0">
+              <div class="cell-sub">
+                共折料 <span class="mono">{{ stockTotal(row) }}{{ STOCK_UNIT }}</span> ·
+                <el-tag
+                  size="small"
+                  effect="plain"
+                  round
+                  :type="stockStatusTone(row)"
+                >{{ stockStatusLabel(row) }}</el-tag>
+              </div>
+              <div v-if="stockWasted(row) > 0" class="cell-sub ratio-error">
+                报损 {{ stockWasted(row) }}{{ STOCK_UNIT }}
+              </div>
+            </template>
+            <el-tooltip v-else content="该批次缺配比，用料账留空待核对" placement="top">
+              <el-tag size="small" type="warning" effect="plain" round>缺配比 · 待核对</el-tag>
+            </el-tooltip>
           </template>
         </el-table-column>
         <el-table-column label="制香人" prop="batch.operator" width="120" />
@@ -458,6 +646,38 @@ function goProportion(row: BatchRow): void {
           :title="`当前方子配比：${selectedRatioTotal}%（${selectedProportionRows.length} 味）`"
           :description="checkMessage"
         />
+        <div v-if="form.formulaId" class="reserve-box">
+          <div class="reserve-box__head">
+            <span>按配比 × 数量折料预留（本地库存）</span>
+            <el-tag v-if="reservePreview.shortages.length > 0" type="error" effect="dark" size="small">
+              库存不足，整批将被拒绝
+            </el-tag>
+            <el-tag v-else-if="reservePreview.items.length > 0" type="success" effect="plain" size="small">
+              库存可满足
+            </el-tag>
+            <el-tag v-else type="warning" effect="plain" size="small">缺配比，先留空待核对</el-tag>
+          </div>
+          <el-table v-if="reservePreview.items.length > 0" :data="reservePreview.items" size="small" row-key="name">
+            <el-table-column label="香料" prop="name" min-width="110" />
+            <el-table-column label="本批用量" width="110">
+              <template #default="{ row }: { row: { amount: number } }">
+                <span class="mono">{{ row.amount }}{{ STOCK_UNIT }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="当前可用" width="110">
+              <template #default="{ row }: { row: { available: number } }">
+                <span class="mono" :class="row.available < 0 ? 'ratio-error' : ''">{{ row.available }}{{ STOCK_UNIT }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="缺口" min-width="100">
+              <template #default="{ row }: { row: { short: number } }">
+                <span v-if="row.short > 0.01" class="ratio-error mono">差 {{ row.short }}{{ STOCK_UNIT }}</span>
+                <span v-else class="ratio-ok">够</span>
+              </template>
+            </el-table-column>
+          </el-table>
+          <p v-if="shortageSummary" class="reserve-box__short">{{ shortageSummary }}</p>
+        </div>
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
@@ -540,6 +760,29 @@ function goProportion(row: BatchRow): void {
 
 .ratio-alert {
   margin-bottom: 12px;
+}
+
+.reserve-box {
+  margin: 4px 0 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 8px;
+  background: var(--el-fill-color-blank);
+}
+
+.reserve-box__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.reserve-box__short {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--el-color-danger);
 }
 
 .snapshot-head h3 {

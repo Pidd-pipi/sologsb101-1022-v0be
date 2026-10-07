@@ -16,6 +16,7 @@ import {
 import type { Batch } from '@/types/batch'
 import type { Formula } from '@/types/formula'
 import { round } from '@/utils/ratio'
+import { useStockStore } from '@/stores/stockStore'
 
 /** 一天的毫秒数 */
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -52,6 +53,8 @@ export const useCellarStore = defineStore('cellar', () => {
   const cellarTable = useIdbTable<Cellar>((database) => database.cellars)
   const batchTable = useIdbTable<Batch>((database) => database.batches, { sortByUpdatedAt: false })
   const formulaTable = useIdbTable<Formula>((database) => database.formulas, { sortByUpdatedAt: false })
+  // 入窖锁定 / 出窖报废回冲走用料账；延迟取 store 以避开模块初始化环
+  const stockStore = useStockStore()
 
   const prefs = readUiPrefs()
   const sortMode = ref<'remain' | 'start'>(prefs.cellarSort)
@@ -217,8 +220,14 @@ export const useCellarStore = defineStore('cellar', () => {
     humidityPct: number
     container: CellarContainer
     state?: CellarState
+    scrapped?: boolean
+    wastePct?: number
   }): Promise<Cellar> {
-    return cellarTable.create(
+    const state = payload.state ?? '窖藏中'
+    const scrapped = payload.scrapped ?? false
+    const wastePct = typeof payload.wastePct === 'number' ? round(payload.wastePct, 1) : 0
+    // 入窖先在台账事务外落窖藏记录，再把该批预留锁成开批那份；若建窖即报废，再回冲
+    const cellar = await cellarTable.create(
       {
         batchId: payload.batchId,
         startDate: payload.startDate,
@@ -226,20 +235,48 @@ export const useCellarStore = defineStore('cellar', () => {
         temperatureC: round(payload.temperatureC, 1),
         humidityPct: round(payload.humidityPct, 1),
         container: payload.container,
-        state: payload.state ?? '窖藏中'
+        state,
+        scrapped: scrapped && state === '已出窖',
+        wastePct: scrapped && state === '已出窖' ? wastePct : 0,
+        scrappedAt: scrapped && state === '已出窖' ? payload.startDate : ''
       },
       'cellar'
+    )
+    await stockStore.lockForCellar({ batchId: payload.batchId })
+    if (scrapped && state === '已出窖') {
+      await stockStore.applyScrap({ batchId: payload.batchId, scrapped: true, wastePct })
+    }
+    return cellar
+  }
+
+  /** 批次脱离窖藏（删窖藏 / 编辑换到别的批次）：撤销报废并把锁定用料退回预留 */
+  async function detachBatchFromCellar(batchId: string): Promise<void> {
+    const remaining = await db.cellars.where('batchId').equals(batchId).count()
+    if (remaining > 0) return
+    await stockStore.applyScrap({ batchId, scrapped: false, wastePct: 0 })
+    const rows = await db.stockLines.where('batchId').equals(batchId).toArray()
+    const now = Date.now()
+    await db.stockLines.bulkPut(
+      rows
+        .filter((line) => line.status === 'locked')
+        .map((line) => ({ ...line, status: 'reserved' as const, lockedAt: 0, updatedAt: now }))
     )
   }
 
   async function updateCellar(id: string, patch: Partial<Cellar>): Promise<void> {
+    const prev = cellarById(id)
     const next: Partial<Cellar> = { ...patch }
     if (patch.temperatureC !== undefined) next.temperatureC = round(patch.temperatureC, 1)
     if (patch.humidityPct !== undefined) next.humidityPct = round(patch.humidityPct, 1)
     await cellarTable.update(id, next)
+    // 编辑时换了关联批次：旧批次解锁退回预留（若无其它窖藏），新批次入窖锁定
+    if (prev && patch.batchId && patch.batchId !== prev.batchId) {
+      await detachBatchFromCellar(prev.batchId)
+      await stockStore.lockForCellar({ batchId: patch.batchId })
+    }
   }
 
-  /** 状态流转：窖藏中 → 已出窖（可回退） */
+  /** 状态流转：窖藏中 → 已出窖（可回退）。报废登记走 markScrap 以携带损耗比例 */
   async function advanceState(id: string): Promise<CellarState | null> {
     const cellar = cellarById(id)
     if (!cellar) return null
@@ -248,8 +285,43 @@ export const useCellarStore = defineStore('cellar', () => {
     if (next === '已出窖' && cellar.endDate > todayIso()) {
       patch.endDate = todayIso()
     }
+    // 普通出窖不算报废；若此前登记过报废，回退/流转时同步撤销报废占用
+    if (next === '已出窖' && !cellar.scrapped) {
+      patch.scrapped = false
+    }
     await cellarTable.update(id, patch)
+    if (next === '窖藏中') {
+      // 回退为在窖：撤销报废，用料恢复为锁定占用
+      await stockStore.applyScrap({ batchId: cellar.batchId, scrapped: false, wastePct: 0 })
+      await db.cellars.update(id, { scrapped: false, wastePct: 0, scrappedAt: '', updatedAt: Date.now() })
+    }
     return next
+  }
+
+  /**
+   * 出窖登记：scrapped=true 表示报废，按 wastePct 损耗回冲用料账
+   * （损耗转 wasted 留痕，未损部分释放回可用库存）。
+   */
+  async function markScrap(
+    id: string,
+    scrapped: boolean,
+    wastePct: number
+  ): Promise<{ wasted: number; returned: number }> {
+    const cellar = cellarById(id)
+    if (!cellar) return { wasted: 0, returned: 0 }
+    const result = await stockStore.applyScrap({
+      batchId: cellar.batchId,
+      scrapped,
+      wastePct
+    })
+    await cellarTable.update(id, {
+      scrapped,
+      wastePct: scrapped ? round(wastePct, 1) : 0,
+      scrappedAt: scrapped ? todayIso() : '',
+      state: '已出窖',
+      endDate: cellar.endDate > todayIso() ? todayIso() : cellar.endDate
+    })
+    return { wasted: result.wasted, returned: result.returned }
   }
 
   async function setState(id: string, state: CellarState): Promise<void> {
@@ -270,8 +342,10 @@ export const useCellarStore = defineStore('cellar', () => {
   }
 
   async function removeCellar(id: string): Promise<void> {
+    const cellar = cellarById(id)
     await cellarTable.remove(id)
     if (currentCellarId.value === id) currentCellarId.value = null
+    if (cellar) await detachBatchFromCellar(cellar.batchId)
   }
 
   async function removeCellarsOfBatch(batchId: string): Promise<number> {
@@ -313,6 +387,7 @@ export const useCellarStore = defineStore('cellar', () => {
     createCellar,
     updateCellar,
     advanceState,
+    markScrap,
     setState,
     releaseOverdue,
     removeCellar,

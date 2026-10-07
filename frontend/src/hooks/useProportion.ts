@@ -1,10 +1,13 @@
 import { computed, ref, watch, type ComputedRef, type Ref } from 'vue'
+import { ElMessage } from 'element-plus'
 import { db } from '@/utils/db'
 import { useProportionStore } from '@/stores/proportionStore'
 import { useFormulaStore } from '@/stores/formulaStore'
 import { useMaterialStore } from '@/stores/materialStore'
+import { useStockStore } from '@/stores/stockStore'
 import type { Proportion, ProportionRole } from '@/types/proportion'
 import type { Material, MaterialGrade, ProcessMethod } from '@/types/material'
+import { StockShortageError } from '@/types/stock'
 import {
   applyManualOrder,
   checkRatioTotal,
@@ -78,6 +81,7 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
   const proportionStore = useProportionStore()
   const formulaStore = useFormulaStore()
   const materialStore = useMaterialStore()
+  const stockStore = useStockStore()
 
   const loading = ref(false)
   const error = ref<string | null>(null)
@@ -133,6 +137,30 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
     void syncFormulaTotal()
   })
 
+  /**
+   * 配比一改，未入窖批次的预留跟着按最新配比重算；已入窖批次用料锁成当时那份不动。
+   * 库存撑不住新配比时整批拒绝重算（配比本身已保存），提示缺哪几味、差多少。
+   */
+  async function recalcStock(): Promise<void> {
+    const id = formulaId.value
+    if (!id) return
+    try {
+      const [proportions, batches, cellars] = await Promise.all([
+        db.proportions.where('formulaId').equals(id).toArray(),
+        db.batches.where('formulaId').equals(id).toArray(),
+        db.cellars.toArray()
+      ])
+      const result = await stockStore.recalcFormula({ formulaId: id, proportions, batches, cellars })
+      if (result.updated > 0) {
+        ElMessage.info(`已按新配比重算 ${result.updated} 个未入窖批次的预留；已入窖批次用料保持锁定`)
+      }
+    } catch (err) {
+      if (err instanceof StockShortageError) {
+        ElMessage.warning(`配比已保存，但库存撑不住新配比，未入窖预留维持原样：${err.message}`)
+      }
+    }
+  }
+
   function nextSeq(id: string): number {
     const list = proportionStore.proportionsByFormula(id)
     return list.length === 0 ? 1 : Math.max(...list.map((item) => item.seq)) + 1
@@ -152,6 +180,7 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
         seq: nextSeq(id)
       })
       await syncFormulaTotal()
+      await recalcStock()
       return record
     } catch (err) {
       error.value = err instanceof Error ? err.message : '新增配比失败'
@@ -171,6 +200,7 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
       if (patch.note !== undefined) next.note = patch.note.trim()
       await proportionStore.updateProportion(id, next)
       await syncFormulaTotal()
+      await recalcStock()
     } catch (err) {
       error.value = err instanceof Error ? err.message : '更新配比失败'
       throw err
@@ -182,6 +212,7 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
   async function remove(id: string): Promise<void> {
     await proportionStore.removeProportion(id)
     await syncFormulaTotal()
+    await recalcStock()
   }
 
   async function writeRatios(ids: string[], ratios: number[]): Promise<void> {
@@ -206,6 +237,7 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
       scaled
     )
     await syncFormulaTotal()
+    await recalcStock()
     return scaled.length
   }
 
@@ -242,6 +274,7 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
     if (!id) return 0
     const count = await proportionStore.clearFormulaProportions(id)
     await syncFormulaTotal()
+    await recalcStock()
     return count
   }
 

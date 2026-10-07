@@ -30,6 +30,12 @@ const routes: RouteRecordRaw[] = [
     meta: { title: '和香工序与成型', icon: 'Box' }
   },
   {
+    path: '/stock',
+    name: 'stock-ledger',
+    component: () => import('@/pages/StockLedger.vue'),
+    meta: { title: '用料账', icon: 'Coin' }
+  },
+  {
     path: '/cellar',
     name: 'cellar-view',
     component: () => import('@/pages/CellarView.vue'),

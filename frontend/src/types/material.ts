@@ -14,10 +14,17 @@ export interface Material {
   processMethod: ProcessMethod
   /** 香气特征 */
   aromaNote: string
+  /** 本地库存容量（克）；老档案缺该字段时为 undefined，升级时按现有预留补出 */
+  stock?: number
+  /** 库存数是升级时按现有预留补出的推断值，人工核对保存后置为 false */
+  stockInferred?: boolean
   /** 入库日期（ISO 日期串 yyyy-MM-dd） */
   createdAt: string
   updatedAt: number
 }
+
+/** 库存计量单位，与用料账折料一致 */
+export const STOCK_UNIT = '克'
 
 export const MATERIAL_GRADES: MaterialGrade[] = ['特级', '一级', '二级']
 export const PROCESS_METHODS: ProcessMethod[] = ['生用', '酒蒸', '蜜炙', '炒黄', '醋浸']

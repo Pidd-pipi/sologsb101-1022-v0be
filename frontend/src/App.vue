@@ -7,6 +7,7 @@ import { useFormulaStore } from '@/stores/formulaStore'
 import { useMaterialStore } from '@/stores/materialStore'
 import { useProportionStore } from '@/stores/proportionStore'
 import { useCellarStore } from '@/stores/cellarStore'
+import { useStockStore } from '@/stores/stockStore'
 import { DB_VERSION } from '@/utils/db'
 
 const route = useRoute()
@@ -15,6 +16,7 @@ const formulaStore = useFormulaStore()
 const materialStore = useMaterialStore()
 const proportionStore = useProportionStore()
 const cellarStore = useCellarStore()
+const stockStore = useStockStore()
 
 interface NavItem {
   path: string
@@ -54,6 +56,13 @@ const navItems = computed<NavItem[]>(() => [
     hint: '和香工序与成型登记'
   },
   {
+    path: '/stock',
+    label: '用料账',
+    icon: Coin,
+    badge: stockBadge.value,
+    hint: '香料库存 × 配比 × 批次的同一条用料账'
+  },
+  {
     path: '/cellar',
     label: '窖藏陈化',
     icon: Coin,
@@ -72,6 +81,12 @@ const navItems = computed<NavItem[]>(() => [
 const activePath = computed(() => {
   const matched = navItems.value.find((item) => route.path.startsWith(item.path))
   return matched?.path ?? '/formulas'
+})
+
+/** 用料账徽标：超占香料味数（0 时显示台账条数） */
+const stockBadge = computed(() => {
+  const shortCount = materialStore.rows.filter((row) => row.available < 0).length
+  return shortCount > 0 ? `-${shortCount}` : String(stockStore.lines.length)
 })
 
 const currentTitle = computed(() => (typeof route.meta.title === 'string' ? route.meta.title : '香方配伍与窖藏陈化档案'))

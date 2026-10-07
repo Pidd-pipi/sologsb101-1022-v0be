@@ -21,8 +21,9 @@ import { PROPORTION_ROLES, type Proportion, type ProportionRole } from '@/types/
 import { FORMING_METHODS, type Batch, type FormingMethod } from '@/types/batch'
 import { CELLAR_CONTAINERS, CELLAR_STATES, type Cellar, type CellarState, type CellarContainer } from '@/types/cellar'
 import type { Tasting } from '@/types/tasting'
+import { STOCK_LINE_STATUSES, type StockLine, type StockLineStatus } from '@/types/stock'
 
-/** 单方香方导出文件结构：一个香方 + 其配比 + 派生批次、窖藏、品香 */
+/** 单方香方导出文件结构：一个香方 + 其配比 + 派生批次、窖藏、品香、用料台账 */
 export interface FormulaExportPayload {
   app: 'gbincense'
   kind: 'formula'
@@ -33,6 +34,8 @@ export interface FormulaExportPayload {
   batches: Batch[]
   cellars: Cellar[]
   tastings: Tasting[]
+  /** 该香方各批次的用料台账（预留/锁定/报损） */
+  stockLines: StockLine[]
   /** 导出时一并携带被引用的香料主档，便于跨设备还原 */
   materials: Material[]
 }
@@ -79,9 +82,10 @@ export async function buildFormulaPayload(formulaId: string): Promise<FormulaExp
     db.batches.where('formulaId').equals(formulaId).toArray()
   ])
   const batchIds = batches.map((batch) => batch.id)
-  const [cellars, tastings] = await Promise.all([
+  const [cellars, tastings, stockLines] = await Promise.all([
     batchIds.length > 0 ? db.cellars.where('batchId').anyOf(batchIds).toArray() : Promise.resolve([]),
-    batchIds.length > 0 ? db.tastings.where('batchId').anyOf(batchIds).toArray() : Promise.resolve([])
+    batchIds.length > 0 ? db.tastings.where('batchId').anyOf(batchIds).toArray() : Promise.resolve([]),
+    batchIds.length > 0 ? db.stockLines.where('batchId').anyOf(batchIds).toArray() : Promise.resolve([])
   ])
   const materialIds = Array.from(new Set(proportions.map((item) => item.materialId)))
   const materials =
@@ -96,6 +100,7 @@ export async function buildFormulaPayload(formulaId: string): Promise<FormulaExp
     batches,
     cellars,
     tastings,
+    stockLines,
     materials
   }
 }
@@ -122,6 +127,7 @@ export async function exportFormulaJson(formulaId: string): Promise<{ fileName: 
       batches: payload.batches.length,
       cellars: payload.cellars.length,
       tastings: payload.tastings.length,
+      stockLines: payload.stockLines.length,
       materials: payload.materials.length
     }
   }
@@ -151,7 +157,8 @@ export async function exportSnapshotJson(): Promise<{ fileName: string; counts: 
       proportions: snapshot.proportions.length,
       batches: snapshot.batches.length,
       cellars: snapshot.cellars.length,
-      tastings: snapshot.tastings.length
+      tastings: snapshot.tastings.length,
+      stockLines: snapshot.stockLines.length
     }
   }
 }
@@ -205,6 +212,9 @@ function parseMaterial(raw: unknown, errors: string[], index: number): Material 
     errors.push(`materials[${index}] processMethod 取值非法：${raw.processMethod}`)
     return null
   }
+  const stockRaw = raw.stock
+  const stock =
+    stockRaw === undefined || stockRaw === null ? undefined : Number.isFinite(Number(stockRaw)) ? Number(stockRaw) : undefined
   return {
     id: asString(raw.id, createId('material')),
     name,
@@ -212,7 +222,42 @@ function parseMaterial(raw: unknown, errors: string[], index: number): Material 
     grade: pickEnum<MaterialGrade>(raw.grade, MATERIAL_GRADE_SET, '二级'),
     processMethod: pickEnum<ProcessMethod>(raw.processMethod, PROCESS_METHOD_SET, '生用'),
     aromaNote: asString(raw.aromaNote),
+    stock,
     createdAt: asString(raw.createdAt, new Date().toISOString().slice(0, 10)),
+    updatedAt: asNumber(raw.updatedAt, Date.now())
+  }
+}
+
+/** 校验并规范化一条用料台账（导入旧文件缺该表时整体留空，不阻断导入） */
+function parseStockLine(raw: unknown, errors: string[], index: number, batchIds: Set<string>): StockLine | null {
+  if (!isRecord(raw)) {
+    errors.push(`stockLines[${index}] 不是合法对象`)
+    return null
+  }
+  const batchId = asString(raw.batchId)
+  if (batchId.length === 0 || !batchIds.has(batchId)) {
+    errors.push(`stockLines[${index}] batchId 无法对应到本次导入的批次`)
+    return null
+  }
+  const status = pickEnum<StockLineStatus>(
+    raw.status,
+    new Set<string>(STOCK_LINE_STATUSES),
+    'reserved'
+  )
+  return {
+    id: asString(raw.id, `${batchId}__${asString(raw.materialId)}`),
+    batchId,
+    formulaId: asString(raw.formulaId),
+    materialId: asString(raw.materialId),
+    materialName: asString(raw.materialName, '未知香料'),
+    ratio: asNumber(raw.ratio, 0),
+    quantity: asNumber(raw.quantity, 0),
+    amount: asNumber(raw.amount, 0),
+    status,
+    lockedAt: asNumber(raw.lockedAt, 0),
+    wastedAmount: asNumber(raw.wastedAmount, 0),
+    wastePct: asNumber(raw.wastePct, 0),
+    wastedAt: asNumber(raw.wastedAt, 0),
     updatedAt: asNumber(raw.updatedAt, Date.now())
   }
 }
@@ -234,6 +279,10 @@ export function validateFormulaJson(input: unknown): ValidateResult<FormulaExpor
   }
   if (!Array.isArray(input.materials)) {
     errors.push('materials 字段缺失或不是数组')
+  }
+  // 老版本导出可能没有 stockLines，缺时按空数组留空待核对，不阻断导入
+  if (input.stockLines !== undefined && !Array.isArray(input.stockLines)) {
+    errors.push('stockLines 字段不是数组')
   }
   if (errors.length > 0 || !formula) {
     return { ok: false, errors: errors.length > 0 ? errors : ['香方解析失败'], payload: null }
@@ -338,6 +387,9 @@ export function validateFormulaJson(input: unknown): ValidateResult<FormulaExpor
       humidityPct: asNumber(raw.humidityPct, 60),
       container: pickEnum<CellarContainer>(raw.container, CELLAR_CONTAINER_SET, '陶罐'),
       state: pickEnum<CellarState>(raw.state, CELLAR_STATE_SET, '窖藏中'),
+      scrapped: raw.scrapped === true,
+      wastePct: asNumber(raw.wastePct, 0),
+      scrappedAt: asString(raw.scrappedAt, ''),
       updatedAt: asNumber(raw.updatedAt, Date.now())
     })
   })
@@ -373,6 +425,15 @@ export function validateFormulaJson(input: unknown): ValidateResult<FormulaExpor
 
   if (errors.length > 0) return { ok: false, errors, payload: null }
 
+  const stockLines: StockLine[] = []
+  const rawStockLines = Array.isArray(input.stockLines) ? (input.stockLines as unknown[]) : []
+  rawStockLines.forEach((raw, index) => {
+    const line = parseStockLine(raw, errors, index, batchIds)
+    if (line) stockLines.push(line)
+  })
+
+  if (errors.length > 0) return { ok: false, errors, payload: null }
+
   return {
     ok: true,
     errors: [],
@@ -386,12 +447,13 @@ export function validateFormulaJson(input: unknown): ValidateResult<FormulaExpor
       batches,
       cellars,
       tastings,
+      stockLines,
       materials
     }
   }
 }
 
-/** 校验全量快照 JSON */
+/** 校验全量快照 JSON（旧版本快照缺 stockLines 时按空数组兜底） */
 export function validateSnapshotJson(input: unknown): ValidateResult<IncenseSnapshot> {
   const errors: string[] = []
   if (!isRecord(input)) return { ok: false, errors: ['文件内容不是合法的 JSON 对象'], payload: null }
@@ -400,8 +462,23 @@ export function validateSnapshotJson(input: unknown): ValidateResult<IncenseSnap
   keys.forEach((key) => {
     if (!Array.isArray(input[key])) errors.push(`${key} 字段缺失或不是数组`)
   })
+  if (input.stockLines !== undefined && !Array.isArray(input.stockLines)) {
+    errors.push('stockLines 字段不是数组')
+  }
   if (errors.length > 0) return { ok: false, errors, payload: null }
-  const snapshot = input as unknown as IncenseSnapshot
+  const raw = input as Partial<IncenseSnapshot>
+  const snapshot: IncenseSnapshot = {
+    app: 'gbincense',
+    dbVersion: asNumber(input.dbVersion, DB_VERSION),
+    exportedAt: asString(input.exportedAt, new Date().toISOString()),
+    formulas: raw.formulas ?? [],
+    materials: raw.materials ?? [],
+    proportions: raw.proportions ?? [],
+    batches: raw.batches ?? [],
+    cellars: raw.cellars ?? [],
+    tastings: raw.tastings ?? [],
+    stockLines: Array.isArray(raw.stockLines) ? raw.stockLines : []
+  }
   return { ok: true, errors: [], payload: snapshot }
 }
 
@@ -461,10 +538,24 @@ export async function importFormulaPayload(
       batchId: batchIdMap.get(tasting.batchId) as string,
       updatedAt: now
     }))
+  const stockLines: StockLine[] = payload.stockLines
+    .filter((line) => batchIdMap.has(line.batchId))
+    .map((line) => {
+      const newBatchId = batchIdMap.get(line.batchId) as string
+      const newMaterialId = materialIdMap.get(line.materialId) ?? line.materialId
+      return {
+        ...line,
+        id: `${newBatchId}__${newMaterialId}`,
+        batchId: newBatchId,
+        formulaId,
+        materialId: newMaterialId,
+        updatedAt: now
+      }
+    })
 
   await db.transaction(
     'rw',
-    [db.formulas, db.materials, db.proportions, db.batches, db.cellars, db.tastings],
+    [db.formulas, db.materials, db.proportions, db.batches, db.cellars, db.tastings, db.stockLines],
     async () => {
       await db.formulas.put(formula)
       if (materials.length > 0) await db.materials.bulkPut(materials)
@@ -472,6 +563,7 @@ export async function importFormulaPayload(
       if (batches.length > 0) await db.batches.bulkPut(batches)
       if (cellars.length > 0) await db.cellars.bulkPut(cellars)
       if (tastings.length > 0) await db.tastings.bulkPut(tastings)
+      if (stockLines.length > 0) await db.stockLines.bulkPut(stockLines)
     }
   )
 
@@ -482,7 +574,8 @@ export async function importFormulaPayload(
       proportions: proportions.length,
       batches: batches.length,
       cellars: cellars.length,
-      tastings: tastings.length
+      tastings: tastings.length,
+      stockLines: stockLines.length
     }
   }
 }
@@ -499,7 +592,8 @@ export async function importSnapshotPayload(
     proportions: snapshot.proportions.length,
     batches: snapshot.batches.length,
     cellars: snapshot.cellars.length,
-    tastings: snapshot.tastings.length
+    tastings: snapshot.tastings.length,
+    stockLines: snapshot.stockLines.length
   }
 }
 

@@ -2,7 +2,9 @@
 
 面向香道工作室与制香作坊的配方留档工具：把每款香方的香料配比、炮制方式、和香成型、窖藏陈化与品香评鉴逐环记录，形成可复用的香方档案。
 
-核心动作：**建香方与用途 → 维护香料库与炮制方式 → 按君臣佐使配比 → 排和香工序与成型 → 管窖藏批次环境 → 录品香评分**。
+核心动作：**建香方与用途 → 维护香料库与炮制方式（含本地库存容量）→ 按君臣佐使配比 → 排和香工序与成型（按配比×数量折料预留）→ 管窖藏批次环境（入窖锁定 / 出窖报废按损耗回冲）→ 录品香评分**。
+
+香料库、配比与和香批次共用**一条用料账**：登记和香批次时按「配比 × 数量」折料，先按本地库存预留，库存撑不住整批拒绝并说清缺哪几味、差多少；两个标签页同时领用只让先到的预留生效；改数量按实到退回多占；配比一变未入窖预留跟着重算、已入窖批次用料锁成当时那份；出窖报废再按损耗回冲。
 
 纯前端单页应用（Vue 3 + TypeScript + Element Plus + Vite + Pinia + Vue Router），**无后端、无数据库服务、无 API 服务**，全部数据保存在浏览器本地（IndexedDB / Dexie + 少量 localStorage 元数据），刷新或重启浏览器后依然存在。
 
@@ -43,7 +45,7 @@ docker compose up -d --build      # 代码改动后重新构建
 | 语言 | TypeScript（`strict: true`，`noUnusedLocals` / `noUnusedParameters` 均开启） | `npm run build` 内含 `vue-tsc --noEmit` 类型检查 |
 | UI 组件库 | Element Plus 2.x（含 `@element-plus/icons-vue`） | 表格、抽屉、对话框、表单、滑块、提示 |
 | 构建工具 | Vite 6 | 开发服务器端口 22822 |
-| 状态管理 | Pinia 2（setup store） | `formulaStore` / `materialStore` / `proportionStore` / `cellarStore` |
+| 状态管理 | Pinia 2（setup store） | `formulaStore` / `materialStore` / `proportionStore` / `cellarStore` / `stockStore` |
 | 路由 | Vue Router 4（history 模式） | nginx 侧配合 `try_files $uri $uri/ /index.html` 做 SPA fallback |
 | 本地存储 | Dexie 4（IndexedDB 封装）+ localStorage | 库名 `gbincense`，含结构版本号与 `upgrade` 迁移逻辑 |
 | 拖拽排序 | HTML5 原生 `draggable` + `dragstart/dragover/drop` | 未引入 `vuedraggable` / `dnd-kit` 等额外依赖 |
@@ -83,17 +85,17 @@ sologsb101-1022/
     ├── public/favicon.svg
     └── src/
         ├── main.ts             # 入口：先 initDatabase() 播种，再挂载应用
-        ├── App.vue             # 顶部导航（6 个模块）+ 底部数据说明
+        ├── App.vue             # 顶部导航（7 个模块）+ 底部数据说明
         ├── env.d.ts
         ├── styles/main.css
-        ├── types/              # formula.ts material.ts proportion.ts batch.ts cellar.ts tasting.ts
-        ├── stores/             # formulaStore.ts materialStore.ts proportionStore.ts cellarStore.ts
+        ├── types/              # formula.ts material.ts proportion.ts batch.ts cellar.ts tasting.ts stock.ts
+        ├── stores/             # formulaStore.ts materialStore.ts proportionStore.ts cellarStore.ts stockStore.ts
         ├── components/common/  # GradeTag.vue FilterBar.vue StatBadge.vue EmptyPanel.vue
         ├── hooks/              # useProportion.ts useIdbTable.ts
         ├── pages/              # FormulaList.vue MaterialLib.vue ProportionBoard.vue
-        │                       # BatchList.vue CellarView.vue TastingBoard.vue
+        │                       # BatchList.vue StockLedger.vue CellarView.vue TastingBoard.vue
         ├── router/index.ts
-        └── utils/              # ratio.ts db.ts export.ts
+        └── utils/              # ratio.ts stock.ts db.ts export.ts
 ```
 
 | 路由 | 页面 | 主要职责 | 消费模型 |
@@ -101,8 +103,9 @@ sologsb101-1022/
 | `/formulas` | 香方台账 | 新建/编辑香方、按香型与用途与状态筛选、卡片回显配比合计与品香均分、状态流转（草稿 → 在用 → 停用）、单方 JSON 导出与导入校验 | Formula、Tasting、Proportion、Batch |
 | `/materials` | 香料库与炮制 | 香料增删改、按等级/产地/炮制方式检索、就地改炮制方式、显示被哪些香方引用、清理闲置香料 | Material、Proportion |
 | `/proportions` | 配比与君臣佐使 | 君臣佐使编排、占比实时校验 100%、一键等比缩放与归一化、**HTML5 原生拖拽排序写回 `seq`**、按权重一键重排 | Proportion、Formula、Material |
-| `/batches` | 和香工序与成型 | 登记和香批次（自动固化配比快照）、快照与当前方子逐味对照、开批次前校验配比是否平衡 | Batch、Formula、Proportion |
-| `/cellar` | 窖藏与环境 | 入窖/出窖登记、温湿度就地录入、按剩余天数排序的临近出窖提醒、状态流转（窖藏中 → 已出窖）、批量处理逾期 | Cellar、Batch、Formula |
+| `/batches` | 和香工序与成型 | 登记和香批次（按配比×数量折料并从本地库存预留，不足整批拒绝）、改数量按实到重算预留、快照与当前方子逐味对照、开批次前校验配比是否平衡 | Batch、Formula、Proportion、StockLine |
+| `/stock` | 用料账 | 香料库存余量（库存/预留/锁定/可用/报损）、逐批用料流水（预留中/入窖锁定/出窖报损）、超占与待核对库存提醒 | StockLine、Material、Batch |
+| `/cellar` | 窖藏与环境 | 入窖即锁定用料、温湿度就地录入、按剩余天数排序的临近出窖提醒、状态流转（窖藏中 → 已出窖）、**出窖报废按损耗比例回冲**、批量处理逾期 | Cellar、Batch、Formula、StockLine |
 | `/tastings` | 品香评鉴与导出 | 香韵 / 留香 / 烟气评分录入、同批次多次评鉴取均分并回写香方列表、结构版本查看、全量 JSON 导出与导入校验 | Tasting、Batch、全部模型 |
 
 `/` 与未匹配路径均重定向到 `/formulas`；页面组件全部懒加载，`router.afterEach` 同步 `document.title`。
@@ -112,21 +115,23 @@ sologsb101-1022/
 ## 五、IndexedDB 库名与数据存储说明
 
 - **库名**：`gbincense`（`frontend/src/utils/db.ts` 中的 `new IncenseDatabase()` → `super('gbincense')`）。
-- **结构版本号**：`export const DB_VERSION = 2`，同时写入 localStorage 键 `gbincense:db-version` 便于比对。
+- **结构版本号**：`export const DB_VERSION = 3`，同时写入 localStorage 键 `gbincense:db-version` 便于比对。
 
 | 表 | 主键与索引 | 说明 |
 | --- | --- | --- |
 | `formulas` | `id, name, scentType, usage, state, createdAt, totalRatio, updatedAt` | 香方主档，`totalRatio` 由配比页实时回写 |
-| `materials` | `id, name, origin, grade, processMethod, updatedAt` | 香料库与炮制方式 |
+| `materials` | `id, name, origin, grade, processMethod, updatedAt` | 香料库与炮制方式，`stock` 为本地库存容量（克） |
 | `proportions` | `id, formulaId, materialId, role, seq, updatedAt` | 君臣佐使配比，`seq` 为拖拽编排顺序 |
 | `batches` | `id, formulaId, mixedAt, formingMethod, updatedAt` | 和香批次，含 `snapshot` 配比快照 |
-| `cellars` | `id, batchId, startDate, endDate, state, updatedAt` | 窖藏批次与环境读数 |
+| `cellars` | `id, batchId, startDate, endDate, state, updatedAt` | 窖藏批次与环境读数，含报废 `scrapped/wastePct` |
 | `tastings` | `id, batchId, tastedAt, smokeScore, updatedAt` | 品香评鉴 |
+| `stockLines` | `id, batchId, formulaId, materialId, status, updatedAt` | 用料台账：一味料×一批次一行，预留/锁定/报损三态 |
 
-- **版本迁移**：`version(1).stores({...})` 为初版结构；`version(DB_VERSION).stores({...}).upgrade(async (tx) => {...})` 为真实迁移，会 `toCollection().modify(...)` 改写历史数据：
-  1. 配比表补齐 `seq`（按 `formulaId` 分组顺序编号）与 `updatedAt`；
-  2. 批次表补齐 `snapshot` 数组与 `snapshotAt`；
-  3. 品香表补齐 `lastingMin` 默认值。
+- **用料账流转**：开批 `reserved`（按配比×数量折料，库存不足整批拒绝）→ 入窖 `locked`（用料冻成开批那份，配比再变也不动）→ 出窖报废 `wasted`（按 `wastePct` 记损耗，未损部分释放回可用）。所有写操作在单个 Dexie 事务内重读最新余量再落库，天然串行化：两个标签页同时领用，先提交的事务占用生效，后提交的一方读到最新余量后被拒，由页面保留草稿重试。
+- **版本迁移**：`version(1).stores({...})` 为初版结构；v2 回填 `seq` / `snapshot` / `lastingMin`；**v3** 新增 `materials.stock` 与 `stockLines` 表，并在 `.upgrade()` 中：
+  1. 老档案缺库存数：按「现有未入窖预留 + 已入窖锁定」占用把每味料的 `stock` 补成恰好够用的值，打 `stockInferred` 标记待人工核对，无占用的补 0；
+  2. 按现有批次快照/当前配比补出 `stockLines`：已入窖（窖藏中/已出窖）的批次锁成快照那份，未入窖的按当前配比预留；**缺配比（空快照）的批次先留空不建台账**，待核对；
+  3. 窖藏补齐 `scrapped / wastePct / scrappedAt` 报废字段。
 - **首屏自动播种**：`main.ts` 在挂载前调用 `initDatabase()`，其中包含 `if ((await db.formulas.count()) === 0) { await seedDatabase() }`，写入 3 款香方 → 7 条配比 / 2 个和香批次 → 2 条窖藏 / 2 条品香（香方 → 配比/批次 → 窖藏/品香 三层互相引用）。播种使用固定 id + `bulkPut`，**幂等**，重复调用不会产生重复数据。
 - **localStorage 元数据**：`gbincense:db-version`（结构版本）、`gbincense:last-backup-at`（上次导出时间）、`gbincense:ui-prefs`（当前香方、配比与窖藏排序方式）。
 - **导出 / 导入**：`utils/export.ts` 提供 `exportFormulaJson()`（单方）与 `exportSnapshotJson()`（全量），导入前用 `validateFormulaJson()` / `validateSnapshotJson()` 做字段与枚举校验，校验失败会提示具体错误且不写库。
